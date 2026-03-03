@@ -1,8 +1,17 @@
 <style>
-table, td, th , tr{
-   border: none!important;
+table {
+    border-collapse: collapse;
+}
+table, th, td, tr{
+   border: none;
+}
+blockquote {
+    border-left: none;
+    padding-left: 10px;
 }
 </style>
+
+
 
 <table style="border: none; width: 100%; background: transparent;">
   <tr>
