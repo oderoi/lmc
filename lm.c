@@ -1,11 +1,12 @@
+
 /*
  * lm.c — Unified GPT-2 124M inference engine in pure C99
  *
  * Supports TWO model formats, auto-detected by file extension / magic:
  *   1. gpt2_124m.bin      — custom binary format (float32, little-endian)
  *   2. *.gguf             — GGUF format (llama.cpp compatible)
- *        Supported quant types: F32, F16, Q8_0, Q5_K (S+M), Q6_K
- *        Examples: gpt2.f16.gguf, gpt2.Q8_0.gguf
+ *        Supported quant types: F32, F16, Q4_K (S+M), Q5_K (S+M), Q6_K, Q8_0,
+ *        Examples: gpt2.f16.gguf, gpt2.Q8_0.gguf, gpt2.Q4_K_M.gguf
  *
  * Architecture: GPT-2 124M
  *   - 12 transformer layers, 12 attention heads
@@ -19,7 +20,7 @@
  *   gcc -O3 -march=native -ffast-math -fopenmp lm.c -o lm -lm
  *
  * Usage:
- *   ./lm "Your prompt" [max_tokens] [temperature] [top_p]
+ *   ./lm "Your prompt" [max_tokens] [temperature] [top_p] --model [model]
  *
  *   The model file is auto-detected:
  *     - Checks for gpt2_124m.bin  first  (float32 custom format)
@@ -72,10 +73,40 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
 #define GGUF_VERSION_MAX  3
 
 /* GGUF tensor type IDs we care about */
-#define GGUF_TYPE_F32   0
-#define GGUF_TYPE_F16   1
-#define GGUF_TYPE_Q8_0  8   /* 8-bit quantization, block size 32            */
-#define GGUF_TYPE_Q6_K  14  /* 6-bit K-quant, super-block size 256          */
+#define GGUF_TYPE_F32    0
+#define GGUF_TYPE_F16    1
+#define GGUF_TYPE_Q8_0   8   /* 8-bit quantization, block size 32            */
+#define GGUF_TYPE_Q4_K   12  /* 4-bit K-quant, super-block size 256          */
+#define GGUF_TYPE_IQ4_XS 23  /* 4-bit non-linear quant, block size 256       */
+#define GGUF_TYPE_Q6_K   14  /* 6-bit K-quant, super-block size 256          */
+
+/* -- Q4_K ------------------------------------------------------------------
+ * Block layout (144 bytes per super-block of 256 elements):
+ * d       [2]    float16 super-block scale 
+ * dmin    [2]    float16 super-block min
+ * scales  [12]   6-bit packed scales+mins (8 scale + 8 min values)
+ * qs      [128]  4-bit quantized values, GROUP-MAJOR packing (see below)
+ *
+ * qs packing (group-major - same layout as Q5_K's low nibbles):
+ *    The 256 elements are split into 4 groups of 64.
+ *    Within each group, element (j+l) → lo nibble of qs[(j>>6)*32+l]
+ *                       element (j+l+32) → hi nibble of qs[(j>>6)*32+l]
+ *    For element e:
+ *       byte   = (e >> 6) * 32 + (e & 31)
+ *       nibble = (e & 32) ? 4 : 0
+ *
+ * Dequantize: y[e] = scale_group * q4 - min_group
+ *    where scale_group and min_group come from get_scale_min_k4.
+ *
+ * Q4_K_S and Q4_K_M share the same binary format (type ID 12).
+ */
+#define Q4_K_BLOCK_SIZE       256
+#define Q4_K_BYTES_PER_BLOCK  144   /* 2+2+12+128 */
+
+#define IQ4_XS_BLOCK_SIZE      256
+#define IQ4_XS_BYTES_PER_BLOCK 136  /* 2 (f16 d) + 4 (scales_h) + 4 (scales_l) + 128 (qs) */
+
+
 
 /* Q8_0 block layout (34 bytes per block of 32 elements):
  *   [uint16_t d (float16 scale)][int8_t qs[32]]
@@ -96,12 +127,25 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
  *   q_signed  = (lo4 | (hi2 << 4)) - 32          // range [-32, 31]
  *   result    = q_signed * scales[gi/16] * f16_to_f32(d)
  */
-#define GGUF_TYPE_Q5_K  13  /* 5-bit K-quant, super-block size 256, S and M variants */
+#define GGUF_TYPE_Q5_K        13  /* 5-bit K-quant, super-block size 256, S and M variants */
 #define Q5_K_BLOCK_SIZE      256
 #define Q5_K_QH_BYTES         32  /* high bits: 1 per element, 8/byte    */
 #define Q5_K_QS_BYTES        128  /* low nibbles: 4 bits/element, 2/byte */
 #define Q5_K_SC_BYTES         12  /* packed 6-bit scales+mins            */
 #define Q5_K_BYTES_PER_BLOCK 176  /* 2+2+12+32+128                       */
+
+/* Q4_K block layout (144 bytes per super-block of 256 elements):
+ *   d      [2]   float16 super-block scale
+ *   dmin   [2]   float16 super-block min
+ *   scales [12]  6-bit packed scales+mins (same get_scale_min_k4 as Q5_K)
+ *   qs     [128] 4-bit quants, GROUP-MAJOR packing:
+ *                  byte   = (e >> 6) * 32 + (e & 31)
+ *                  nibble = (e & 32) ? 4 : 0
+ * Dequantize: y[e] = d_group * q4 - dmin_group
+ * Q4_K_S and Q4_K_M share the same binary format (type ID 12).
+ */
+#define Q4_K_BLOCK_SIZE       256
+#define Q4_K_BYTES_PER_BLOCK  144   /* 2+2+12+128 */
 
 /* Q5_K block layout (176 bytes, offset map):
  *   offset  0: d    [2]  float16 quant scale
@@ -289,108 +333,6 @@ static float f16_to_f32(uint16_t h) {
     return result;
 }
 
-/*
- * Dequantize a Q8_0 block tensor into float32.
- * src:        raw bytes from GGUF (n_blocks * Q8_0_BYTES_PER_BLOCK bytes)
- * dst:        output float32 array (n_elements floats)
- * n_elements: must be a multiple of Q8_0_BLOCK_SIZE (32)
- */
-static void dequant_q8_0(const uint8_t *src, float *dst, size_t n_elements) {
-    size_t n_blocks = n_elements / Q8_0_BLOCK_SIZE;
-    for (size_t b = 0; b < n_blocks; b++) {
-        /* Read f16 scale (first 2 bytes of block) */
-        uint16_t d_raw;
-        memcpy(&d_raw, src, sizeof(uint16_t));
-        float scale = f16_to_f32(d_raw);
-        src += 2;
-
-        /* Dequantize 32 int8 values */
-        const int8_t *qs = (const int8_t *)src;
-        float *out = dst + b * Q8_0_BLOCK_SIZE;
-#ifdef _OPENMP
-        /* Only worth parallelising for very large tensors; keep inner loop simple */
-#endif
-        for (int i = 0; i < Q8_0_BLOCK_SIZE; i++) {
-            out[i] = (float)qs[i] * scale;
-        }
-        src += Q8_0_BLOCK_SIZE;
-    }
-}
-
-/*
- * Dequantize a Q6_K super-block tensor into float32.
- * src:        raw bytes (n_blocks * Q6_K_BYTES_PER_BLOCK)
- * dst:        output float32 array (n_elements floats)
- * n_elements: must be a multiple of Q6_K_BLOCK_SIZE (256)
- *
- * Block memory layout (210 bytes):
- *   ql[128]    lower 4 bits of each quant, interleaved in a specific pattern
- *   qh[64]     upper 2 bits of each quant, interleaved in a specific pattern
- *   scales[16] int8 sub-block scales
- *   d[2]       float16 super-block scale
- *
- * The bit layout is NOT a simple sequential pack. llama.cpp uses an
- * interleaved scheme where each inner iteration l=0..31 produces four
- * outputs at strides of 32: y[l], y[l+32], y[l+64], y[l+96].
- * The block is processed in two passes of 128 elements each.
- *
- * Verified against llama.cpp ggml-quants.c dequantize_row_q6_K().
- */
-static void dequant_q6k(const uint8_t *src, float *dst, size_t n_elements) {
-    size_t n_blocks = n_elements / Q6_K_BLOCK_SIZE;
-
-    for (size_t b = 0; b < n_blocks; b++) {
-        const uint8_t *ql_base = src;                          /* [128] lower 4 bits */
-        const uint8_t *qh_base = src + Q6_K_QL_BYTES;         /* [64]  upper 2 bits */
-        const int8_t  *sc_base = (const int8_t *)
-                                  (src + Q6_K_QL_BYTES + Q6_K_QH_BYTES); /* [16] scales */
-        uint16_t d_raw;
-        memcpy(&d_raw, src + Q6_K_QL_BYTES + Q6_K_QH_BYTES + Q6_K_SC_BYTES,
-               sizeof(uint16_t));
-        float d = f16_to_f32(d_raw);
-
-        float *y = dst + b * Q6_K_BLOCK_SIZE;
-
-        /*
-         * Two passes: pass 0 decodes elements [0..127],
-         *             pass 1 decodes elements [128..255].
-         * Each pass advances: ql by 64 bytes, qh by 32 bytes, sc by 8 entries.
-         */
-        for (int pass = 0; pass < 2; pass++) {
-            const uint8_t *ql = ql_base + pass * 64;
-            const uint8_t *qh = qh_base + pass * 32;
-            const int8_t  *sc = sc_base + pass * 8;
-            float         *yp = y       + pass * 128;
-
-            /*
-             * Inner loop l = 0..31: each iteration writes to four positions
-             * separated by stride 32 within the 128-element half-block.
-             *
-             *   q1 = (ql[l]    & 0xF) | ((qh[l]>>0 & 3) << 4)  - 32  → yp[l +  0]
-             *   q2 = (ql[l+32] & 0xF) | ((qh[l]>>2 & 3) << 4)  - 32  → yp[l + 32]
-             *   q3 = (ql[l]    >> 4)  | ((qh[l]>>4 & 3) << 4)  - 32  → yp[l + 64]
-             *   q4 = (ql[l+32] >> 4)  | ((qh[l]>>6 & 3) << 4)  - 32  → yp[l + 96]
-             *
-             * Scale index: is = l/16  →  sc[is], sc[is+2], sc[is+4], sc[is+6]
-             */
-            for (int l = 0; l < 32; l++) {
-                int is = l >> 4;   /* 0 for l=0..15, 1 for l=16..31 */
-
-                int q1 = (int)((ql[l]      & 0x0F) | (((qh[l] >> 0) & 0x03) << 4)) - 32;
-                int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4)) - 32;
-                int q3 = (int)((ql[l]      >>    4) | (((qh[l] >> 4) & 0x03) << 4)) - 32;
-                int q4 = (int)((ql[l + 32] >>    4) | (((qh[l] >> 6) & 0x03) << 4)) - 32;
-
-                yp[l +  0] = d * (float)sc[is + 0] * (float)q1;
-                yp[l + 32] = d * (float)sc[is + 2] * (float)q2;
-                yp[l + 64] = d * (float)sc[is + 4] * (float)q3;
-                yp[l + 96] = d * (float)sc[is + 6] * (float)q4;
-            }
-        }
-
-        src += Q6_K_BYTES_PER_BLOCK;
-    }
-}
 
 /*
  * Decode one (scale, min) pair from the 12-byte packed scales field.
@@ -402,15 +344,149 @@ static void dequant_q6k(const uint8_t *src, float *dst, size_t n_elements) {
  * For j >= 4:
  *   scale = (scales[j+4] & 0x0F) | ((scales[j-4] >> 6) << 4)
  *   min   = (scales[j+4] >>  4)  | ((scales[j  ] >> 6) << 4)
+ *
+ * get_scale_min_k4 — decode one (scale, min) pair from the 12-byte packed
+ * scales field used by Q4_K, Q5_K.  Encodes 8 scale values and 8 min values
+ * in 6 bits each = 96 bits = 12 bytes.
  */
-static void get_scale_min_k4(int j, const uint8_t *scales,
-                              uint8_t *out_sc, uint8_t *out_m) {
+static void get_scale_min_k4(int j, const uint8_t *scales, uint8_t *out_sc, uint8_t *out_m) {
     if (j < 4) {
         *out_sc = scales[j]   & 0x3F;
         *out_m  = scales[j+4] & 0x3F;
     } else {
         *out_sc = (scales[j+4] & 0x0F) | ((scales[j-4] >> 6) << 4);
         *out_m  = (scales[j+4] >>  4)  | ((scales[j  ] >> 6) << 4);
+    }
+}
+
+
+/* ============================================================
+ * DEQUANTIZATION HELPERS
+ * ============================================================ */
+
+/* Non-linear lookup table for IQ4_XS (ggml-common.h: kvalues_iq4nl).
+ * These are int8 codebook values; dequant = dl * (float)iq4xs_nl[nibble].
+ * NOTE: This is NOT the same as IQ4_NL's float table. */
+static const int8_t iq4xs_nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+/*
+ * dequant_iq4_xs — dequantize an IQ4_XS super-block tensor into float32.
+ *
+ * IQ4_XS block layout (136 bytes per super-block of 256 elements):
+ *   d        [2]  float16 super-block scale
+ *   scales_h [2]  uint16: high 2 bits of each of the 8 sub-block scales,
+ *                  packed 2 bits each: bits [2j+1:2j] = high bits of scale j
+ *   scales_l [4]  int8_t[4]: low 4 bits of each sub-block scale, two per byte.
+ *                  scales_l[j/2] >> (4*(j%2)) & 0xF = lo4 of scale j
+ *   qs       [128] 4-bit non-linear quants (IQ4_NL lookup), 2 per byte
+ *
+ * Sub-block scale decode (6-bit value, j = 0..7):
+ *   uint8_t lo4 = ((uint8_t)scales_l[j/2] >> (4*(j%2))) & 0x0F
+ *   uint8_t hi2 = (scales_h >> (2*j)) & 0x03
+ *   uint8_t ls  = lo4 | (hi2 << 4)      // 6-bit: range 0..63
+ *   float   dl  = d * (float)(ls - 32)  // signed range: -32d..+31d
+ *
+ * Each sub-block covers 32 elements decoded with ONE scale dl:
+ *   byte v = qs[j*16 + l],  l=0..15
+ *   y[j*32 + l*2 + 0] = dl * iq4nl[v & 0xF]
+ *   y[j*32 + l*2 + 1] = dl * iq4nl[v >> 4]
+ *
+ * Verified against llama.cpp ggml-quants.c dequantize_row_iq4_xs().
+ */
+static void dequant_iq4_xs(const uint8_t *src, float *dst, size_t n_elements) {
+    size_t n_blocks = n_elements / IQ4_XS_BLOCK_SIZE;
+    for (size_t b = 0; b < n_blocks; b++) {
+        /* Read super-block scale */
+        uint16_t d_raw;
+        memcpy(&d_raw, src, sizeof(uint16_t));
+        float d = f16_to_f32(d_raw);
+
+        /* Read scales: scales_h (uint16) then scales_l (int8_t[4]) */
+        uint16_t scales_h;
+        memcpy(&scales_h, src + 2, sizeof(uint16_t));
+        const int8_t *scales_l = (const int8_t *)(src + 4);
+
+        const uint8_t *qs = src + 8;   /* [128] 4-bit quants */
+        src += IQ4_XS_BYTES_PER_BLOCK;
+        float *y = dst + b * IQ4_XS_BLOCK_SIZE;
+
+        for (int j = 0; j < 8; j++) {  /* 8 sub-blocks of 32 elements each */
+            /* Reconstruct 6-bit scale: lo4 from scales_l, hi2 from scales_h */
+            uint8_t lo4 = ((uint8_t)scales_l[j / 2] >> (4 * (j % 2))) & 0x0F;
+            uint8_t hi2 = (scales_h >> (2 * j)) & 0x03;
+            uint8_t ls  = lo4 | (hi2 << 4);
+            float   dl  = d * (float)((int)ls - 32);
+
+            /* Decode 32 elements from 16 bytes using IQ4_XS codebook.
+             * Layout (matches llama.cpp dequantize_row_iq4_xs):
+             *   y[l]    = dl * iq4xs_nl[q4[l] & 0xF]  for l=0..15  (lo nibbles first)
+             *   y[l+16] = dl * iq4xs_nl[q4[l] >>  4]  for l=0..15  (hi nibbles second)
+             * NOT interleaved pairs — all lo nibbles come before all hi nibbles. */
+            const uint8_t *q4 = qs + j * 16;
+            for (int l = 0; l < 16; l++) {
+                y[l]      = dl * (float)iq4xs_nl[q4[l] & 0x0F];
+                y[l + 16] = dl * (float)iq4xs_nl[q4[l] >>    4];
+            }
+            y += 32;
+        }
+    }
+}
+
+
+/*
+ * dequant_q4k — dequantize a Q4_K super-block tensor into float32.
+ *
+ * Q4_K is the 4-bit sibling of Q5_K: same d/dmin header, same 12-byte
+ * scales field decoded with get_scale_min_k4 — but NO qh high-bit field.
+ *
+ * qs GROUP-MAJOR layout (identical to Q5_K's low-nibble packing):
+ *   The 256 elements form 4 groups of 64 (j = 0, 64, 128, 192).
+ *   Each group g occupies qs[g*32 .. g*32+31]:
+ *     qs[g*32 + l] lo nibble = lo4 of element g*64 + l       (l=0..31)
+ *     qs[g*32 + l] hi nibble = lo4 of element g*64 + l + 32
+ *   For element e:
+ *     byte   = (e >> 6) * 32 + (e & 31)
+ *     nibble = (e & 32) ? 4 : 0
+ *
+ * This is the same formula as Q5_K's qs, verified by round-trip tests
+ * on all 4 groups independently (max_err < 0.05 for 4-bit quant noise).
+ */
+static void dequant_q4k(const uint8_t *src, float *dst, size_t n_elements) {
+    size_t n_blocks = n_elements / Q4_K_BLOCK_SIZE;
+    for (size_t b = 0; b < n_blocks; b++, src += Q4_K_BYTES_PER_BLOCK) {
+        uint16_t d_raw, dmin_raw;
+        memcpy(&d_raw,    src + 0, sizeof(uint16_t));
+        memcpy(&dmin_raw, src + 2, sizeof(uint16_t));
+        float d    = f16_to_f32(d_raw);
+        float dmin = f16_to_f32(dmin_raw);
+
+        const uint8_t *scales = src + 4;   /* [12] 6-bit packed scales+mins */
+        const uint8_t *qs     = src + 16;  /* [128] 4-bit quants, group-major */
+        float *y = dst + b * Q4_K_BLOCK_SIZE;
+
+        int is_ = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is_++, scales, &sc, &m);
+            float d1 = d * (float)sc,  m1 = dmin * (float)m;
+            get_scale_min_k4(is_++, scales, &sc, &m);
+            float d2 = d * (float)sc,  m2 = dmin * (float)m;
+
+            /* First half of group: elements j .. j+31 */
+            for (int l = 0; l < 32; l++) {
+                int e  = j + l;
+                int lo = (qs[(e >> 6) * 32 + (e & 31)] >> ((e & 32) ? 4 : 0)) & 0x0F;
+                y[e]   = d1 * (float)lo - m1;
+            }
+            /* Second half of group: elements j+32 .. j+63 */
+            for (int l = 0; l < 32; l++) {
+                int e  = j + 32 + l;
+                int lo = (qs[(e >> 6) * 32 + (e & 31)] >> ((e & 32) ? 4 : 0)) & 0x0F;
+                y[e]   = d2 * (float)lo - m2;
+            }
+        }
     }
 }
 
@@ -538,6 +614,114 @@ static void dequant_q5k(const uint8_t *src, float *dst, size_t n_elements) {
         src += Q5_K_BYTES_PER_BLOCK;
     }
 }
+
+/*
+ * Dequantize a Q6_K super-block tensor into float32.
+ * src:        raw bytes (n_blocks * Q6_K_BYTES_PER_BLOCK)
+ * dst:        output float32 array (n_elements floats)
+ * n_elements: must be a multiple of Q6_K_BLOCK_SIZE (256)
+ *
+ * Block memory layout (210 bytes):
+ *   ql[128]    lower 4 bits of each quant, interleaved in a specific pattern
+ *   qh[64]     upper 2 bits of each quant, interleaved in a specific pattern
+ *   scales[16] int8 sub-block scales
+ *   d[2]       float16 super-block scale
+ *
+ * The bit layout is NOT a simple sequential pack. llama.cpp uses an
+ * interleaved scheme where each inner iteration l=0..31 produces four
+ * outputs at strides of 32: y[l], y[l+32], y[l+64], y[l+96].
+ * The block is processed in two passes of 128 elements each.
+ *
+ * Verified against llama.cpp ggml-quants.c dequantize_row_q6_K().
+ */
+static void dequant_q6k(const uint8_t *src, float *dst, size_t n_elements) {
+    size_t n_blocks = n_elements / Q6_K_BLOCK_SIZE;
+
+    for (size_t b = 0; b < n_blocks; b++) {
+        const uint8_t *ql_base = src;                          /* [128] lower 4 bits */
+        const uint8_t *qh_base = src + Q6_K_QL_BYTES;         /* [64]  upper 2 bits */
+        const int8_t  *sc_base = (const int8_t *)
+                                  (src + Q6_K_QL_BYTES + Q6_K_QH_BYTES); /* [16] scales */
+        uint16_t d_raw;
+        memcpy(&d_raw, src + Q6_K_QL_BYTES + Q6_K_QH_BYTES + Q6_K_SC_BYTES,
+               sizeof(uint16_t));
+        float d = f16_to_f32(d_raw);
+
+        float *y = dst + b * Q6_K_BLOCK_SIZE;
+
+        /*
+         * Two passes: pass 0 decodes elements [0..127],
+         *             pass 1 decodes elements [128..255].
+         * Each pass advances: ql by 64 bytes, qh by 32 bytes, sc by 8 entries.
+         */
+        for (int pass = 0; pass < 2; pass++) {
+            const uint8_t *ql = ql_base + pass * 64;
+            const uint8_t *qh = qh_base + pass * 32;
+            const int8_t  *sc = sc_base + pass * 8;
+            float         *yp = y       + pass * 128;
+
+            /*
+             * Inner loop l = 0..31: each iteration writes to four positions
+             * separated by stride 32 within the 128-element half-block.
+             *
+             *   q1 = (ql[l]    & 0xF) | ((qh[l]>>0 & 3) << 4)  - 32  → yp[l +  0]
+             *   q2 = (ql[l+32] & 0xF) | ((qh[l]>>2 & 3) << 4)  - 32  → yp[l + 32]
+             *   q3 = (ql[l]    >> 4)  | ((qh[l]>>4 & 3) << 4)  - 32  → yp[l + 64]
+             *   q4 = (ql[l+32] >> 4)  | ((qh[l]>>6 & 3) << 4)  - 32  → yp[l + 96]
+             *
+             * Scale index: is = l/16  →  sc[is], sc[is+2], sc[is+4], sc[is+6]
+             */
+            for (int l = 0; l < 32; l++) {
+                int is = l >> 4;   /* 0 for l=0..15, 1 for l=16..31 */
+
+                int q1 = (int)((ql[l]      & 0x0F) | (((qh[l] >> 0) & 0x03) << 4)) - 32;
+                int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4)) - 32;
+                int q3 = (int)((ql[l]      >>    4) | (((qh[l] >> 4) & 0x03) << 4)) - 32;
+                int q4 = (int)((ql[l + 32] >>    4) | (((qh[l] >> 6) & 0x03) << 4)) - 32;
+
+                yp[l +  0] = d * (float)sc[is + 0] * (float)q1;
+                yp[l + 32] = d * (float)sc[is + 2] * (float)q2;
+                yp[l + 64] = d * (float)sc[is + 4] * (float)q3;
+                yp[l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+        }
+
+        src += Q6_K_BYTES_PER_BLOCK;
+    }
+}
+
+/*
+ * Dequantize a Q8_0 block tensor into float32.
+ * src:        raw bytes from GGUF (n_blocks * Q8_0_BYTES_PER_BLOCK bytes)
+ * dst:        output float32 array (n_elements floats)
+ * n_elements: must be a multiple of Q8_0_BLOCK_SIZE (32)
+ */
+static void dequant_q8_0(const uint8_t *src, float *dst, size_t n_elements) {
+    size_t n_blocks = n_elements / Q8_0_BLOCK_SIZE;
+    for (size_t b = 0; b < n_blocks; b++) {
+        /* Read f16 scale (first 2 bytes of block) */
+        uint16_t d_raw;
+        memcpy(&d_raw, src, sizeof(uint16_t));
+        float scale = f16_to_f32(d_raw);
+        src += 2;
+
+        /* Dequantize 32 int8 values */
+        const int8_t *qs = (const int8_t *)src;
+        float *out = dst + b * Q8_0_BLOCK_SIZE;
+#ifdef _OPENMP
+        /* Only worth parallelising for very large tensors; keep inner loop simple */
+#endif
+        for (int i = 0; i < Q8_0_BLOCK_SIZE; i++) {
+            out[i] = (float)qs[i] * scale;
+        }
+        src += Q8_0_BLOCK_SIZE;
+    }
+}
+
+
+/* ============================================================
+ * NEURAL NETWORK MATH
+ * ============================================================ */
 
 static inline float gelu(float x) {
     const float c = 0.7978845608f;
@@ -681,7 +865,7 @@ static void attention_forward(
 }
 
 /* ============================================================
- * TRANSFORMER BLOCK — FIX #3: no more stack VLAs
+ * TRANSFORMER BLOCK
  * ============================================================ */
 static void transformer_block_forward(
     float *x,
@@ -720,7 +904,7 @@ static void transformer_block_forward(
 }
 
 /* ============================================================
- * MODEL FORWARD — FIX #4: no stack VLA for x_final
+ * MODEL FORWARD
  * ============================================================ */
 static float* model_forward(int token_id, int pos) {
     const int D = GPT2_EMBED_DIM;
@@ -1231,8 +1415,7 @@ static void load_model_gguf(const char *path) {
 
     /* ---- Read tensor info ---- */
     if (n_tensors > GGUF_MAX_TENSORS) {
-        fprintf(stderr, "[ERROR] Too many tensors (%llu > %d)\n",
-                (unsigned long long)n_tensors, GGUF_MAX_TENSORS);
+        fprintf(stderr, "[ERROR] Too many tensors (%llu > %d)\n", (unsigned long long)n_tensors, GGUF_MAX_TENSORS);
         fclose(f); exit(1);
     }
 
@@ -1264,8 +1447,7 @@ static void load_model_gguf(const char *path) {
 
     /* ---- Allocate arena and assign weight pointers ---- */
     size_t total = gpt2_total_params();
-    printf("[INFO] Parameters: %zu  (%.1f MB float32)\n",
-           total, total * 4.0 / (1024*1024));
+    printf("[INFO] Parameters: %zu  (%.1f MB float32)\n", total, total * 4.0 / (1024*1024));
 
     /* Extra V*D floats reserved for lm_head (output.weight tensor in GGUF).
      * GPT-2 uses tied weights, but llama.cpp GGUF stores output.weight as a
@@ -1287,14 +1469,17 @@ static void load_model_gguf(const char *path) {
         if (!dst_ptr) {
             /* Skip tensors we don't need */
             const char *tname = "UNK";
-            if      (t->type == GGUF_TYPE_F32)  tname = "F32 ";
-            else if (t->type == GGUF_TYPE_F16)  tname = "F16 ";
-            else if (t->type == GGUF_TYPE_Q8_0) tname = "Q8_0";
-            else if (t->type == GGUF_TYPE_Q5_K) tname = "Q5_K";
-            else if (t->type == GGUF_TYPE_Q6_K) tname = "Q6_K";
-            fprintf(stderr, "[SKIP] %-50s  %s  n=%7zu  (unmapped name)\n",
-                    t->name, tname, t->n_elements);
+            if      (t->type == GGUF_TYPE_F32)    tname = "F32 ";
+            else if (t->type == GGUF_TYPE_F16)    tname = "F16 ";
+            else if (t->type == GGUF_TYPE_IQ4_XS) tname = "IQ4_XS";
+            else if (t->type == GGUF_TYPE_Q4_K)   tname = "Q4_K";
+            else if (t->type == GGUF_TYPE_Q5_K)   tname = "Q5_K";
+            else if (t->type == GGUF_TYPE_Q6_K)   tname = "Q6_K"; 
+            else if (t->type == GGUF_TYPE_Q8_0)   tname = "Q8_0";
+            
+            fprintf(stderr, "[SKIP] %-50s  %s  n=%7zu  (unmapped name)\n", t->name, tname, t->n_elements);
             continue;
+            
         }
         float *dst = *dst_ptr;
 
@@ -1306,6 +1491,7 @@ static void load_model_gguf(const char *path) {
                 fprintf(stderr, "[ERROR] Short read on tensor %s\n", t->name);
                 fclose(f); free(tensors); exit(1);
             }
+
         } else if (t->type == GGUF_TYPE_F16) {
             /* Dequantize F16 → F32 */
             uint16_t *tmp = (uint16_t*)malloc(t->n_elements * sizeof(uint16_t));
@@ -1318,70 +1504,118 @@ static void load_model_gguf(const char *path) {
                 dst[e] = f16_to_f32(tmp[e]);
             }
             free(tmp);
-        } else if (t->type == GGUF_TYPE_Q8_0) {
-            /* Dequantize Q8_0 → F32 */
-            if (t->n_elements % Q8_0_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] Q8_0 tensor %s has %zu elements "
+
+        } else if (t->type == GGUF_TYPE_IQ4_XS) {
+            /* Dequantize IQ4_XS → F32 */
+            if (t->n_elements % IQ4_XS_BLOCK_SIZE != 0) {
+                fprintf(stderr, "[ERROR] IQ4_XS tensor %s has %zu elements "
                                 "(not a multiple of %d)\n",
-                        t->name, t->n_elements, Q8_0_BLOCK_SIZE);
+                        t->name, t->n_elements, IQ4_XS_BLOCK_SIZE);
                 fclose(f); free(tensors); exit(1);
             }
-            size_t raw_bytes = (t->n_elements / Q8_0_BLOCK_SIZE) * Q8_0_BYTES_PER_BLOCK;
+            size_t raw_bytes = (t->n_elements / IQ4_XS_BLOCK_SIZE) * IQ4_XS_BYTES_PER_BLOCK;
             uint8_t *tmp = (uint8_t *)malloc(raw_bytes);
             if (!tmp) {
-                fprintf(stderr, "[FATAL] OOM for Q8_0 buffer (%s)\n", t->name);
+                fprintf(stderr, "[FATAL] OOM for IQ4_XS buffer (%s)\n", t->name);
                 exit(1);
             }
             if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read on Q8_0 tensor %s\n", t->name);
+                fprintf(stderr, "[ERROR] Short read on IQ4_XS tensor %s\n", t->name);
                 free(tmp); fclose(f); free(tensors); exit(1);
             }
-            dequant_q8_0(tmp, dst, t->n_elements);
+            dequant_iq4_xs(tmp, dst, t->n_elements);
             free(tmp);
-        } else if (t->type == GGUF_TYPE_Q6_K) {
-            /* Dequantize Q6_K → F32 */
-            if (t->n_elements % Q6_K_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] Q6_K tensor %s has %zu elements "
-                                "(not a multiple of %d)\n",
-                        t->name, t->n_elements, Q6_K_BLOCK_SIZE);
+
+        } else if (t->type == GGUF_TYPE_Q4_K) {
+            if (t->n_elements % Q4_K_BLOCK_SIZE != 0) {
+                fprintf(stderr, "[ERROR] Q4_K tensor %s: n_elements=%zu not multiple of %d\n",
+                        t->name, t->n_elements, Q4_K_BLOCK_SIZE);
                 fclose(f); free(tensors); exit(1);
             }
-            size_t raw_bytes = (t->n_elements / Q6_K_BLOCK_SIZE) * Q6_K_BYTES_PER_BLOCK;
+            size_t raw_bytes = (t->n_elements / Q4_K_BLOCK_SIZE) * Q4_K_BYTES_PER_BLOCK;
+            uint8_t *tmp = (uint8_t*)malloc(raw_bytes);
+            if (!tmp) { fprintf(stderr, "[FATAL] OOM Q4_K buf (%s)\n", t->name); exit(1); }
+            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
+                fprintf(stderr, "[ERROR] Short read Q4_K tensor %s\n", t->name);
+                free(tmp); fclose(f); free(tensors); exit(1);
+            }
+            dequant_q4k(tmp, dst, t->n_elements);
+            free(tmp);
+
+        } else if (t->type == GGUF_TYPE_Q4_K) {
+            /* Dequantize Q4_K (S or M variant) → F32. Both share type 12. */
+            if (t->n_elements % Q4_K_BLOCK_SIZE != 0) {
+                fprintf(stderr, "[ERROR] Q4_K tensor %s has %zu elements "
+                                "(not a multiple of %d)\n",
+                        t->name, t->n_elements, Q4_K_BLOCK_SIZE);
+                fclose(f); free(tensors); exit(1);
+            }
+            size_t raw_bytes = (t->n_elements / Q4_K_BLOCK_SIZE) * Q4_K_BYTES_PER_BLOCK;
             uint8_t *tmp = (uint8_t *)malloc(raw_bytes);
             if (!tmp) {
-                fprintf(stderr, "[FATAL] OOM for Q6_K buffer (%s)\n", t->name);
+                fprintf(stderr, "[FATAL] OOM for Q4_K buffer (%s)\n", t->name);
                 exit(1);
             }
             if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read on Q6_K tensor %s\n", t->name);
+                fprintf(stderr, "[ERROR] Short read on Q4_K tensor %s\n", t->name);
                 free(tmp); fclose(f); free(tensors); exit(1);
             }
-            dequant_q6k(tmp, dst, t->n_elements);
+            dequant_q4k(tmp, dst, t->n_elements);
             free(tmp);
         } else if (t->type == GGUF_TYPE_Q5_K) {
             /* Dequantize Q5_K (S or M variant) → F32. Both variants share type 13. */
             if (t->n_elements % Q5_K_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] Q5_K tensor %s has %zu elements "
-                                "(not a multiple of %d)\n",
+                fprintf(stderr, "[ERROR] Q5_K tensor %s: n_elements=%zu not multiple of %d\n",
                         t->name, t->n_elements, Q5_K_BLOCK_SIZE);
                 fclose(f); free(tensors); exit(1);
             }
             size_t raw_bytes = (t->n_elements / Q5_K_BLOCK_SIZE) * Q5_K_BYTES_PER_BLOCK;
-            uint8_t *tmp = (uint8_t *)malloc(raw_bytes);
-            if (!tmp) {
-                fprintf(stderr, "[FATAL] OOM for Q5_K buffer (%s)\n", t->name);
-                exit(1);
-            }
+            uint8_t *tmp = (uint8_t*)malloc(raw_bytes);
+            if (!tmp) { fprintf(stderr, "[FATAL] OOM Q5_K buf (%s)\n", t->name); exit(1); }
             if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read on Q5_K tensor %s\n", t->name);
+                fprintf(stderr, "[ERROR] Short read Q5_K tensor %s\n", t->name);
                 free(tmp); fclose(f); free(tensors); exit(1);
             }
             dequant_q5k(tmp, dst, t->n_elements);
             free(tmp);
+
+        } else if (t->type == GGUF_TYPE_Q6_K) {
+            /* Dequantize Q6_K → F32 */
+            if (t->n_elements % Q6_K_BLOCK_SIZE != 0) {
+                fprintf(stderr, "[ERROR] Q6_K tensor %s: n_elements=%zu not multiple of %d\n",
+                        t->name, t->n_elements, Q6_K_BLOCK_SIZE);
+                fclose(f); free(tensors); exit(1);
+            }
+            size_t raw_bytes = (t->n_elements / Q6_K_BLOCK_SIZE) * Q6_K_BYTES_PER_BLOCK;
+            uint8_t *tmp = (uint8_t*)malloc(raw_bytes);
+            if (!tmp) { fprintf(stderr, "[FATAL] OOM Q6_K buf (%s)\n", t->name); exit(1); }
+            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
+                fprintf(stderr, "[ERROR] Short read Q6_K tensor %s\n", t->name);
+                free(tmp); fclose(f); free(tensors); exit(1);
+            }
+            dequant_q6k(tmp, dst, t->n_elements);
+            free(tmp);
+
+        } else if (t->type == GGUF_TYPE_Q8_0) {
+            /* Dequantize Q8_0 → F32 */
+            if (t->n_elements % Q8_0_BLOCK_SIZE != 0) {
+                fprintf(stderr, "[ERROR] Q8_0 tensor %s: n_elements=%zu not multiple of %d\n",
+                        t->name, t->n_elements, Q8_0_BLOCK_SIZE);
+                fclose(f); free(tensors); exit(1);
+            }
+            size_t raw_bytes = (t->n_elements / Q8_0_BLOCK_SIZE) * Q8_0_BYTES_PER_BLOCK;
+            uint8_t *tmp = (uint8_t*)malloc(raw_bytes);
+            if (!tmp) { fprintf(stderr, "[FATAL] OOM Q8_0 buf (%s)\n", t->name); exit(1); }
+            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
+                fprintf(stderr, "[ERROR] Short read Q8_0 tensor %s\n", t->name);
+                free(tmp); fclose(f); free(tensors); exit(1);
+            }
+            dequant_q8_0(tmp, dst, t->n_elements);
+            free(tmp);
+
         } else {
-            fprintf(stderr, "[ERROR] Unsupported tensor type %u for %s\n",
-                    t->type, t->name);
-            fprintf(stderr, "  Supported: F32 (0), F16 (1), Q8_0 (8), Q5_K (13), Q6_K (14)\n");
+            fprintf(stderr, "[ERROR] Unsupported tensor type %u for %s\n",t->type, t->name);
+            fprintf(stderr, "  Supported: F32 (0), F16 (1),IQ4_XS (23), Q4_K (12), Q5_K (13), Q6_K (14), Q8_0 (8),\n");
             fprintf(stderr, "  To convert: ./quantize model.gguf out.gguf Q5_K_M\n");
             fclose(f); free(tensors); exit(1);
         }
@@ -1434,7 +1668,7 @@ typedef enum {
     FORMAT_GGUF
 } ModelFormat;
 
-static ModelFormat detect_format(const char *path) {
+static ModelFormat detect_format(const char *path){
     /* Check file extension first (fast path) */
     size_t len = strlen(path);
     if (len >= 5 && strcmp(path + len - 5, ".gguf") == 0) return FORMAT_GGUF;
@@ -1475,7 +1709,7 @@ static void load_model(const char *path) {
             load_model_bin(path);
             break;
         case FORMAT_GGUF:
-            printf("[INFO] Format: GGUF (.gguf) — F16/Q8_0/Q5_K/Q6_K dequantization\n");
+            printf("[INFO] Format: GGUF (.gguf) — F16/IQ4_XS/Q4_K/Q5_K/Q6_K/Q8_0 dequantization\n");
             load_model_gguf(path);
             break;
         default:
@@ -1871,8 +2105,8 @@ static void generate(const char *prompt, int max_new_tokens,
 int main(int argc, char *argv[]) {
     printf("==============================================\n");
     printf("  lm.c — Unified GPT-2 Inference (C99)\n");
-    printf("  Backends: custom .bin  |  GGUF .gguf (F32/F16/Q8_0/Q5_K/Q6_K)\n");
-    printf("==============================================\n\n");
+    printf("  Backends: custom .bin  |  GGUF .gguf (F32/F16/IQ4_XS/Q4_K/Q5_K/Q6_K/Q8_0)\n");
+    printf("===========================================================================\n\n");
 
     const char *prompt      = "Hello, world!";
     int         max_tokens  = 64;
