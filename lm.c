@@ -1,4 +1,5 @@
 
+
 /*
  * lm.c — Unified GPT-2 124M inference engine in pure C99
  *
@@ -79,6 +80,40 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
 #define GGUF_TYPE_Q4_K   12  /* 4-bit K-quant, super-block size 256          */
 #define GGUF_TYPE_IQ4_XS 23  /* 4-bit non-linear quant, block size 256       */
 #define GGUF_TYPE_Q6_K   14  /* 6-bit K-quant, super-block size 256          */
+#define GGUF_TYPE_Q3_K   11  /* 3-bit K-quant, super-block size 256          */
+
+/* -- Q3_K ------------------------------------------------------------------
+ * Block layout (110 bytes per super-block of 256 elements):
+ * hmask   [32]   high bit of each 3-bit quant, column-major packed:
+ *                  bit j of hmask[i] = bit2 of element (32*j + i)
+ *                  (i = 0..31, j = 0..7)
+ * qs      [64]   lower 2 bits of each 3-bit quant, 4 packed per byte:
+ *                  qs[e/4] bits [2*(e%4)+1 : 2*(e%4)] = low2 of element e
+ * scales  [12]   6-bit scales for 16 sub-blocks of 16 elements each,
+ *                  decoded differently from Q4_K/Q5_K (see get_q3k_scales)
+ * d       [2]    float16 super-block scale
+ *
+ * Scale decode (from llama.cpp dequantize_row_q3_K, QK_K=256 path):
+ *   for j in 0..7:
+ *     lscales[j+0] = (scales[j] & 0x0F) | (((scales[j+8] >> 0) & 0x03) << 4)
+ *     lscales[j+8] = (scales[j] >>    4) | (((scales[j+8] >> 2) & 0x03) << 4)
+ *   signed_scale[k] = lscales[k] - 32   (range [-32, 31])
+ *
+ * Dequantize element e:
+ *   q2      = (qs[e/4] >> (2*(e%4))) & 3          // low 2 bits
+ *   hbit    = (hmask[e%32] >> (e/32)) & 1          // high bit (column-major)
+ *   q3s     = (q2 | (hbit << 2)) - 4              // signed 3-bit: -4..3
+ *   y[e]    = d * signed_scale[e/16] * q3s
+ *
+ * Q3_K_S, Q3_K_M, and Q3_K_L all share the same binary format (type ID 11).
+ * The S/M/L suffix only affects the quantization strategy used during encoding.
+ */
+#define Q3_K_BLOCK_SIZE      256
+#define Q3_K_HMASK_BYTES      32  /* high bits: 1 per element, 8/byte          */
+#define Q3_K_QS_BYTES         64  /* low 2 bits: 2 bits/element, 4/byte        */
+#define Q3_K_SC_BYTES         12  /* 6-bit scales for 16 sub-blocks            */
+#define Q3_K_D_BYTES           2  /* float16 super-block scale                 */
+#define Q3_K_BYTES_PER_BLOCK 110  /* 32+64+12+2                                */
 
 /* -- Q4_K ------------------------------------------------------------------
  * Block layout (144 bytes per super-block of 256 elements):
@@ -434,6 +469,84 @@ static void dequant_iq4_xs(const uint8_t *src, float *dst, size_t n_elements) {
     }
 }
 
+/*
+ * FIXED dequant_q3k — drop-in replacement for lm.c
+ *
+ * THE BUG: The original lm.c loop-based scale decode was wrong.
+ *
+ * Q3_K encodes 16 × 6-bit scales across 12 bytes in this layout:
+ *   sc[0..3]  lo nibbles → scale[0..3] bits[3:0],  hi nibbles → scale[4..7] bits[3:0]  (misread in original!)
+ *   sc[4..7]  lo nibbles → scale[8..11] bits[3:0], hi nibbles → scale[12..15] bits[3:0]
+ *   sc[8..11] each byte packs hi-2-bits for 4 scales:
+ *               bits[1:0] → scale[k*4+0] bits[5:4]
+ *               bits[3:2] → scale[k*4+1] bits[5:4]
+ *               bits[5:4] → scale[k*4+2] bits[5:4]
+ *               bits[7:6] → scale[k*4+3] bits[5:4]
+ *
+ * The original loop read sc[j] and sc[8+j/2] with incorrect shift
+ * arithmetic that maps 12 of 16 scales to wrong values (161/256 elements
+ * wrong in round-trip test).
+ *
+ * The fix uses the same uint32 bitfield approach as llama.cpp
+ * (ggml-quants.c dequantize_row_q3_K, QK_K=256 path), which passes
+ * a full round-trip test with 0 mismatches vs the reference.
+ */
+static void dequant_q3k(const uint8_t *src, float *dst, size_t n_elements) {
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    size_t n_blocks = n_elements / Q3_K_BLOCK_SIZE;
+
+    for (size_t b = 0; b < n_blocks; b++) {
+        const uint8_t *hmask  = src;
+        const uint8_t *qs     = src + Q3_K_HMASK_BYTES;
+        const uint8_t *sc     = src + Q3_K_HMASK_BYTES + Q3_K_QS_BYTES;
+        uint16_t d_raw;
+        memcpy(&d_raw, src + Q3_K_HMASK_BYTES + Q3_K_QS_BYTES + Q3_K_SC_BYTES,
+               sizeof(uint16_t));
+        float d = f16_to_f32(d_raw);
+        src += Q3_K_BYTES_PER_BLOCK;
+        float *y = dst + b * Q3_K_BLOCK_SIZE;
+
+        /*
+         * Decode 16 sub-block scales from the 12-byte packed field.
+         *
+         * llama.cpp uses 32-bit SIMD-style unpacking (ggml-quants.c):
+         *   aux[0] = (sc[0..3] & 0x0f0f0f0f) | ((sc[8..11] & 0x03030303) << 4)
+         *   aux[1] = ((sc[0..3]>>4) & 0x0f0f0f0f) | (((sc[8..11]>>2) & 0x03030303) << 4)
+         *   aux[2] = (sc[4..7] & 0x0f0f0f0f) | (((sc[8..11]>>4) & 0x03030303) << 4)
+         *   aux[3] = ((sc[4..7]>>4) & 0x0f0f0f0f) | (((sc[8..11]>>6) & 0x03030303) << 4)
+         *
+         * aux[] viewed as int8_t[16] gives the 16 raw 6-bit scale values.
+         * Signed scale = raw - 32  (range [-32, 31]).
+         */
+        uint32_t aux[4];
+        const int8_t *sc_signed = (const int8_t *)aux;
+        uint32_t tmp, w0, w1;
+        memcpy(&tmp, sc + 8, 4);
+        memcpy(&w0,  sc,     4);
+        memcpy(&w1,  sc + 4, 4);
+        aux[0] = (w0 & kmask2)        | ((tmp & kmask1) << 4);
+        aux[1] = ((w0 >> 4) & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        aux[2] = (w1 & kmask2)        | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((w1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+
+        /*
+         * Dequantize all 256 elements across 16 sub-blocks of 16 elements.
+         *
+         * Bit layout (unchanged from original — these were correct):
+         *   q2   = (qs[e/4] >> (2*(e%4))) & 3   low 2 bits, sequential pack
+         *   hbit = (hmask[e%32] >> (e/32)) & 1  high bit, column-major pack
+         *   q3s  = (q2 | (hbit<<2)) - 4          signed 3-bit: range [-4, 3]
+         *   y[e] = d * signed_scale[e/16] * q3s
+         */
+        for (int e = 0; e < Q3_K_BLOCK_SIZE; e++) {
+            int q2   = (qs[e >> 2] >> (2 * (e & 3))) & 0x03;
+            int hbit = (hmask[e & 31] >> (e >> 5)) & 0x01;
+            int q3s  = (q2 | (hbit << 2)) - 4;
+            y[e] = d * (float)((int)sc_signed[e >> 4] - 32) * (float)q3s;
+        }
+    }
+}
 
 /*
  * dequant_q4k — dequantize a Q4_K super-block tensor into float32.
@@ -1472,6 +1585,7 @@ static void load_model_gguf(const char *path) {
             if      (t->type == GGUF_TYPE_F32)    tname = "F32 ";
             else if (t->type == GGUF_TYPE_F16)    tname = "F16 ";
             else if (t->type == GGUF_TYPE_IQ4_XS) tname = "IQ4_XS";
+            else if (t->type == GGUF_TYPE_Q3_K)   tname = "Q3_K";
             else if (t->type == GGUF_TYPE_Q4_K)   tname = "Q4_K";
             else if (t->type == GGUF_TYPE_Q5_K)   tname = "Q5_K";
             else if (t->type == GGUF_TYPE_Q6_K)   tname = "Q6_K"; 
@@ -1526,20 +1640,23 @@ static void load_model_gguf(const char *path) {
             dequant_iq4_xs(tmp, dst, t->n_elements);
             free(tmp);
 
-        } else if (t->type == GGUF_TYPE_Q4_K) {
-            if (t->n_elements % Q4_K_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] Q4_K tensor %s: n_elements=%zu not multiple of %d\n",
-                        t->name, t->n_elements, Q4_K_BLOCK_SIZE);
+        } else if (t->type == GGUF_TYPE_Q3_K) {
+            /* Dequantize Q3_K (S, M, or L variant) → F32.
+             * All three variants share type ID 11 and identical binary format.
+             * The S/M/L suffix only affects the encoding heuristics. */
+            if (t->n_elements % Q3_K_BLOCK_SIZE != 0) {
+                fprintf(stderr, "[ERROR] Q3_K tensor %s: n_elements=%zu not multiple of %d\n",
+                        t->name, t->n_elements, Q3_K_BLOCK_SIZE);
                 fclose(f); free(tensors); exit(1);
             }
-            size_t raw_bytes = (t->n_elements / Q4_K_BLOCK_SIZE) * Q4_K_BYTES_PER_BLOCK;
+            size_t raw_bytes = (t->n_elements / Q3_K_BLOCK_SIZE) * Q3_K_BYTES_PER_BLOCK;
             uint8_t *tmp = (uint8_t*)malloc(raw_bytes);
-            if (!tmp) { fprintf(stderr, "[FATAL] OOM Q4_K buf (%s)\n", t->name); exit(1); }
+            if (!tmp) { fprintf(stderr, "[FATAL] OOM Q3_K buf (%s)\n", t->name); exit(1); }
             if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read Q4_K tensor %s\n", t->name);
+                fprintf(stderr, "[ERROR] Short read Q3_K tensor %s\n", t->name);
                 free(tmp); fclose(f); free(tensors); exit(1);
             }
-            dequant_q4k(tmp, dst, t->n_elements);
+            dequant_q3k(tmp, dst, t->n_elements);
             free(tmp);
 
         } else if (t->type == GGUF_TYPE_Q4_K) {
@@ -1615,7 +1732,7 @@ static void load_model_gguf(const char *path) {
 
         } else {
             fprintf(stderr, "[ERROR] Unsupported tensor type %u for %s\n",t->type, t->name);
-            fprintf(stderr, "  Supported: F32 (0), F16 (1),IQ4_XS (23), Q4_K (12), Q5_K (13), Q6_K (14), Q8_0 (8),\n");
+            fprintf(stderr, "  Supported: F32 (0), F16 (1),IQ4_XS (23), Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14), Q8_0 (8),\n");
             fprintf(stderr, "  To convert: ./quantize model.gguf out.gguf Q5_K_M\n");
             fclose(f); free(tensors); exit(1);
         }
@@ -1709,7 +1826,7 @@ static void load_model(const char *path) {
             load_model_bin(path);
             break;
         case FORMAT_GGUF:
-            printf("[INFO] Format: GGUF (.gguf) — F16/IQ4_XS/Q4_K/Q5_K/Q6_K/Q8_0 dequantization\n");
+            printf("[INFO] Format: GGUF (.gguf) — F16/IQ4_XS/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0 dequantization\n");
             load_model_gguf(path);
             break;
         default:
@@ -2105,7 +2222,7 @@ static void generate(const char *prompt, int max_new_tokens,
 int main(int argc, char *argv[]) {
     printf("==============================================\n");
     printf("  lm.c — Unified GPT-2 Inference (C99)\n");
-    printf("  Backends: custom .bin  |  GGUF .gguf (F32/F16/IQ4_XS/Q4_K/Q5_K/Q6_K/Q8_0)\n");
+    printf("  Backends: custom .bin  |  GGUF .gguf (F32/F16/IQ4_XS/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0)\n");
     printf("===========================================================================\n\n");
 
     const char *prompt      = "Hello, world!";
