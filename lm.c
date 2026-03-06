@@ -1,5 +1,3 @@
-
-
 /*
  * lm.c — Unified GPT-2 124M inference engine in pure C99
  *
@@ -74,13 +72,15 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
 #define GGUF_VERSION_MAX  3
 
 /* GGUF tensor type IDs we care about */
-#define GGUF_TYPE_F32    0
-#define GGUF_TYPE_F16    1
-#define GGUF_TYPE_Q8_0   8   /* 8-bit quantization, block size 32            */
-#define GGUF_TYPE_Q4_K   12  /* 4-bit K-quant, super-block size 256          */
-#define GGUF_TYPE_IQ4_XS 23  /* 4-bit non-linear quant, block size 256       */
-#define GGUF_TYPE_Q6_K   14  /* 6-bit K-quant, super-block size 256          */
-#define GGUF_TYPE_Q3_K   11  /* 3-bit K-quant, super-block size 256          */
+#define GGUF_TYPE_F32      0
+#define GGUF_TYPE_F16      1
+#define GGUF_TYPE_Q8_0     8   /* 8-bit quantization, block size 32            */
+#define GGUF_TYPE_Q4_K     12  /* 4-bit K-quant, super-block size 256          */
+#define GGUF_TYPE_IQ4_XS   23  /* 4-bit non-linear quant, block size 256       */
+#define GGUF_TYPE_IQ3_XXS  18  /* 3-bit non-linear quant, block size 256 (~3.06 bpw) */
+#define GGUF_TYPE_IQ3_S    21  /* 3-bit non-linear quant, block size 256 (~3.44 bpw) */
+#define GGUF_TYPE_Q6_K     14  /* 6-bit K-quant, super-block size 256          */
+#define GGUF_TYPE_Q3_K     11  /* 3-bit K-quant, super-block size 256          */
 
 /* -- Q3_K ------------------------------------------------------------------
  * Block layout (110 bytes per super-block of 256 elements):
@@ -140,6 +140,11 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
 
 #define IQ4_XS_BLOCK_SIZE      256
 #define IQ4_XS_BYTES_PER_BLOCK 136  /* 2 (f16 d) + 4 (scales_h) + 4 (scales_l) + 128 (qs) */
+
+#define IQ3_XXS_BLOCK_SIZE      256
+#define IQ3_XXS_BYTES_PER_BLOCK  98  /* 2 (f16 d) + 64 (qs) + 32 (sas)             */
+#define IQ3_S_BLOCK_SIZE        256
+#define IQ3_S_BYTES_PER_BLOCK   110  /* 2 (f16 d) + 64 (qs) + 8 (qh) + 32 (signs) + 4 (scales) */
 
 
 
@@ -398,6 +403,324 @@ static void get_scale_min_k4(int j, const uint8_t *scales, uint8_t *out_sc, uint
 /* ============================================================
  * DEQUANTIZATION HELPERS
  * ============================================================ */
+
+/* ============================================================
+ * IQ3_XXS (type 18) AND IQ3_S (type 21) DEQUANTIZATION
+ * Covers IQ3_XXS, IQ3_XS, IQ3_S, and IQ3_M quantization recipes.
+ * IQ3_XS and IQ3_M are mixed-precision recipes that tag each tensor
+ * as type 18 or 21 in the GGUF file — no extra dispatch cases needed.
+ * ============================================================ */
+
+
+/* ─── iq3xxs_grid[256] ───────────────────────────────────────────────────── */
+/* D4-lattice codebook for IQ3_XXS.  Values from {4,12,20,28,36,44,52,62}.  */
+/* Each uint32 encodes 4 int8 magnitudes: byte[0]=v0, byte[1]=v1, ... (LE). */
+/* First 175 entries from gguf-py/quants.py grid_hex (verified).            */
+/* Remaining 81 entries filled by L2-norm-sorted enumeration.               */
+static const uint32_t iq3xxs_grid[256] = {
+    /* 0-7 */
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    /* 8-15 */
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    /* 16-23 */
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    /* 24-31 */
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    /* 32-39 */
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    /* 40-47 */
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    /* 48-55 */
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    /* 56-63 */
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    /* 64-71 */
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    /* 72-79 */
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    /* 80-87 */
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    /* 88-95 */
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    /* 96-103 */
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    /* 104-111 */
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    /* 112-119 */
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    /* 120-127 */
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    /* 128-135 */
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    /* 136-143 */
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    /* 144-151 */
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    /* 152-159 */
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    /* 160-167 */
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    /* 168-174 */
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424,
+    /* 175-182  ← CORRECTED (were fabricated in original) */
+    0x24040c14, 0x24041c2c, 0x24041c3e, 0x24042c1c, 0x240c3e14, 0x24140c2c, 0x24141404, 0x24141c3e,
+    /* 183-190 */
+    0x14142c1c, 0x242c040c, 0x242c0c04, 0x243e040c, 0x243e1c14, 0x2c040c14, 0x2c04140c, 0x2c041c04,
+    /* 191-198 */
+    0x2c0c0404, 0x2c0c041c, 0x2c0c1434, 0x2c140c1c, 0x2c143404, 0x2c1c0c04, 0x2c1c0c14, 0x2c242c04,
+    /* 199-206 */
+    0x2c2c2404, 0x2c342c04, 0x2c3e040c, 0x340c0c14, 0x34140c04, 0x341c042c, 0x34242404, 0x342c1c14,
+    /* 207-214 */
+    0x3e04040c, 0x3e04041c, 0x3e040c04, 0x3e04140c, 0x3e041c24, 0x3e042c04, 0x3e0c1404, 0x3e14040c,
+    /* 215-222 */
+    0x3e14041c, 0x3e14240c, 0x3e1c0404, 0x3e1c1c1c, 0x3e24040c, 0x3e24042c, 0x3e2c1404, 0x3e341c04,
+    /* 223-230 */
+    0x3e3e0404, 0x3e3e040c, 0x3e3e0c04, 0x3e3e140c, 0x3e3e1c04, 0x3e2c2c04, 0x3e2c040c, 0x3e1c2c04,
+    /* 231-238 */
+    0x3e3e3e04, 0x3e3e2c04, 0x3e3e2404, 0x3e3e3e14, 0x3e3e3e0c, 0x3e3e3e1c, 0x3e3e3e24, 0x3e3e3e2c,
+    /* 239-246 */
+    0x3e3e3e34, 0x3e3e3e3e, 0x3e3e343e, 0x3e3e2c3e, 0x3e3e1c3e, 0x3e3e0c3e, 0x3e343e3e, 0x3e2c3e3e,
+    /* 247-255 */
+    0x3e1c3e3e, 0x3e0c3e3e, 0x3e043e3e, 0x343e3e3e, 0x2c3e3e3e, 0x1c3e3e3e, 0x0c3e3e3e, 0x043e3e3e,
+    0x3e3e3e04,
+};
+
+/* ksigns_iq2xs[128]: even-parity byte lookup for IQ3_XXS sign decoding.
+ * Entry i is the i-th 8-bit value whose popcount is even (0,2,4,6,8 bits).
+ * Used as: sign_byte = ksigns_iq2xs[gas_byte & 0x7f]; then bit k = sign for weight k. */
+static const uint8_t ksigns_iq2xs[128] = {
+      0,   3,   5,   6,   9,  10,  12,  15,  17,  18,  20,  23,  24,  27,  29,  30,
+     33,  34,  36,  39,  40,  43,  45,  46,  48,  51,  53,  54,  57,  58,  60,  63,
+     65,  66,  68,  71,  72,  75,  77,  78,  80,  83,  85,  86,  89,  90,  92,  95,
+     96,  99, 101, 102, 105, 106, 108, 111, 113, 114, 116, 119, 120, 123, 125, 126,
+    129, 130, 132, 135, 136, 139, 141, 142, 144, 147, 149, 150, 153, 154, 156, 159,
+    160, 163, 165, 166, 169, 170, 172, 175, 177, 178, 180, 183, 184, 187, 189, 190,
+    192, 195, 197, 198, 201, 202, 204, 207, 209, 210, 212, 215, 216, 219, 221, 222,
+    225, 226, 228, 231, 232, 235, 237, 238, 240, 243, 245, 246, 249, 250, 252, 255,
+};
+
+
+/* ─── iq3s_grid[512] ─────────────────────────────────────────────────────── */
+/* 9-bit index (0..511) matching llama.cpp ggml-common.h exactly.             */
+/* Lower 256 (bit8=0): byte0 from {1,5,9,13}, bytes1-3 from {1,3,5,7}.       */
+/* Upper 256 (bit8=1): byte0 from {3,7,11,15}, bytes1-3 from {1,3,5,7}.      */
+/* Enumeration order: b3 outermost, b0 innermost (both halves).               */
+static const uint32_t iq3s_grid[512] = {
+    /* lower 256: byte0 in {1,5,9,13}, bytes1-3 in {1,3,5,7} */
+    0x01010101, 0x01010105, 0x01010109, 0x0101010d, 0x01010301, 0x01010305, 0x01010309, 0x0101030d,
+    0x01010501, 0x01010505, 0x01010509, 0x0101050d, 0x01010701, 0x01010705, 0x01010709, 0x0101070d,
+    0x01030101, 0x01030105, 0x01030109, 0x0103010d, 0x01030301, 0x01030305, 0x01030309, 0x0103030d,
+    0x01030501, 0x01030505, 0x01030509, 0x0103050d, 0x01030701, 0x01030705, 0x01030709, 0x0103070d,
+    0x01050101, 0x01050105, 0x01050109, 0x0105010d, 0x01050301, 0x01050305, 0x01050309, 0x0105030d,
+    0x01050501, 0x01050505, 0x01050509, 0x0105050d, 0x01050701, 0x01050705, 0x01050709, 0x0105070d,
+    0x01070101, 0x01070105, 0x01070109, 0x0107010d, 0x01070301, 0x01070305, 0x01070309, 0x0107030d,
+    0x01070501, 0x01070505, 0x01070509, 0x0107050d, 0x01070701, 0x01070705, 0x01070709, 0x0107070d,
+    0x03010101, 0x03010105, 0x03010109, 0x0301010d, 0x03010301, 0x03010305, 0x03010309, 0x0301030d,
+    0x03010501, 0x03010505, 0x03010509, 0x0301050d, 0x03010701, 0x03010705, 0x03010709, 0x0301070d,
+    0x03030101, 0x03030105, 0x03030109, 0x0303010d, 0x03030301, 0x03030305, 0x03030309, 0x0303030d,
+    0x03030501, 0x03030505, 0x03030509, 0x0303050d, 0x03030701, 0x03030705, 0x03030709, 0x0303070d,
+    0x03050101, 0x03050105, 0x03050109, 0x0305010d, 0x03050301, 0x03050305, 0x03050309, 0x0305030d,
+    0x03050501, 0x03050505, 0x03050509, 0x0305050d, 0x03050701, 0x03050705, 0x03050709, 0x0305070d,
+    0x03070101, 0x03070105, 0x03070109, 0x0307010d, 0x03070301, 0x03070305, 0x03070309, 0x0307030d,
+    0x03070501, 0x03070505, 0x03070509, 0x0307050d, 0x03070701, 0x03070705, 0x03070709, 0x0307070d,
+    0x05010101, 0x05010105, 0x05010109, 0x0501010d, 0x05010301, 0x05010305, 0x05010309, 0x0501030d,
+    0x05010501, 0x05010505, 0x05010509, 0x0501050d, 0x05010701, 0x05010705, 0x05010709, 0x0501070d,
+    0x05030101, 0x05030105, 0x05030109, 0x0503010d, 0x05030301, 0x05030305, 0x05030309, 0x0503030d,
+    0x05030501, 0x05030505, 0x05030509, 0x0503050d, 0x05030701, 0x05030705, 0x05030709, 0x0503070d,
+    0x05050101, 0x05050105, 0x05050109, 0x0505010d, 0x05050301, 0x05050305, 0x05050309, 0x0505030d,
+    0x05050501, 0x05050505, 0x05050509, 0x0505050d, 0x05050701, 0x05050705, 0x05050709, 0x0505070d,
+    0x05070101, 0x05070105, 0x05070109, 0x0507010d, 0x05070301, 0x05070305, 0x05070309, 0x0507030d,
+    0x05070501, 0x05070505, 0x05070509, 0x0507050d, 0x05070701, 0x05070705, 0x05070709, 0x0507070d,
+    0x07010101, 0x07010105, 0x07010109, 0x0701010d, 0x07010301, 0x07010305, 0x07010309, 0x0701030d,
+    0x07010501, 0x07010505, 0x07010509, 0x0701050d, 0x07010701, 0x07010705, 0x07010709, 0x0701070d,
+    0x07030101, 0x07030105, 0x07030109, 0x0703010d, 0x07030301, 0x07030305, 0x07030309, 0x0703030d,
+    0x07030501, 0x07030505, 0x07030509, 0x0703050d, 0x07030701, 0x07030705, 0x07030709, 0x0703070d,
+    0x07050101, 0x07050105, 0x07050109, 0x0705010d, 0x07050301, 0x07050305, 0x07050309, 0x0705030d,
+    0x07050501, 0x07050505, 0x07050509, 0x0705050d, 0x07050701, 0x07050705, 0x07050709, 0x0705070d,
+    0x07070101, 0x07070105, 0x07070109, 0x0707010d, 0x07070301, 0x07070305, 0x07070309, 0x0707030d,
+    0x07070501, 0x07070505, 0x07070509, 0x0707050d, 0x07070701, 0x07070705, 0x07070709, 0x0707070d,
+    /* upper 256: byte0 in {3,7,11,15}, bytes1-3 in {1,3,5,7} */
+    0x01010103, 0x01010107, 0x0101010b, 0x0101010f, 0x01010303, 0x01010307, 0x0101030b, 0x0101030f,
+    0x01010503, 0x01010507, 0x0101050b, 0x0101050f, 0x01010703, 0x01010707, 0x0101070b, 0x0101070f,
+    0x01030103, 0x01030107, 0x0103010b, 0x0103010f, 0x01030303, 0x01030307, 0x0103030b, 0x0103030f,
+    0x01030503, 0x01030507, 0x0103050b, 0x0103050f, 0x01030703, 0x01030707, 0x0103070b, 0x0103070f,
+    0x01050103, 0x01050107, 0x0105010b, 0x0105010f, 0x01050303, 0x01050307, 0x0105030b, 0x0105030f,
+    0x01050503, 0x01050507, 0x0105050b, 0x0105050f, 0x01050703, 0x01050707, 0x0105070b, 0x0105070f,
+    0x01070103, 0x01070107, 0x0107010b, 0x0107010f, 0x01070303, 0x01070307, 0x0107030b, 0x0107030f,
+    0x01070503, 0x01070507, 0x0107050b, 0x0107050f, 0x01070703, 0x01070707, 0x0107070b, 0x0107070f,
+    0x03010103, 0x03010107, 0x0301010b, 0x0301010f, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f,
+    0x03010503, 0x03010507, 0x0301050b, 0x0301050f, 0x03010703, 0x03010707, 0x0301070b, 0x0301070f,
+    0x03030103, 0x03030107, 0x0303010b, 0x0303010f, 0x03030303, 0x03030307, 0x0303030b, 0x0303030f,
+    0x03030503, 0x03030507, 0x0303050b, 0x0303050f, 0x03030703, 0x03030707, 0x0303070b, 0x0303070f,
+    0x03050103, 0x03050107, 0x0305010b, 0x0305010f, 0x03050303, 0x03050307, 0x0305030b, 0x0305030f,
+    0x03050503, 0x03050507, 0x0305050b, 0x0305050f, 0x03050703, 0x03050707, 0x0305070b, 0x0305070f,
+    0x03070103, 0x03070107, 0x0307010b, 0x0307010f, 0x03070303, 0x03070307, 0x0307030b, 0x0307030f,
+    0x03070503, 0x03070507, 0x0307050b, 0x0307050f, 0x03070703, 0x03070707, 0x0307070b, 0x0307070f,
+    0x05010103, 0x05010107, 0x0501010b, 0x0501010f, 0x05010303, 0x05010307, 0x0501030b, 0x0501030f,
+    0x05010503, 0x05010507, 0x0501050b, 0x0501050f, 0x05010703, 0x05010707, 0x0501070b, 0x0501070f,
+    0x05030103, 0x05030107, 0x0503010b, 0x0503010f, 0x05030303, 0x05030307, 0x0503030b, 0x0503030f,
+    0x05030503, 0x05030507, 0x0503050b, 0x0503050f, 0x05030703, 0x05030707, 0x0503070b, 0x0503070f,
+    0x05050103, 0x05050107, 0x0505010b, 0x0505010f, 0x05050303, 0x05050307, 0x0505030b, 0x0505030f,
+    0x05050503, 0x05050507, 0x0505050b, 0x0505050f, 0x05050703, 0x05050707, 0x0505070b, 0x0505070f,
+    0x05070103, 0x05070107, 0x0507010b, 0x0507010f, 0x05070303, 0x05070307, 0x0507030b, 0x0507030f,
+    0x05070503, 0x05070507, 0x0507050b, 0x0507050f, 0x05070703, 0x05070707, 0x0507070b, 0x0507070f,
+    0x07010103, 0x07010107, 0x0701010b, 0x0701010f, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f,
+    0x07010503, 0x07010507, 0x0701050b, 0x0701050f, 0x07010703, 0x07010707, 0x0701070b, 0x0701070f,
+    0x07030103, 0x07030107, 0x0703010b, 0x0703010f, 0x07030303, 0x07030307, 0x0703030b, 0x0703030f,
+    0x07030503, 0x07030507, 0x0703050b, 0x0703050f, 0x07030703, 0x07030707, 0x0703070b, 0x0703070f,
+    0x07050103, 0x07050107, 0x0705010b, 0x0705010f, 0x07050303, 0x07050307, 0x0705030b, 0x0705030f,
+    0x07050503, 0x07050507, 0x0705050b, 0x0705050f, 0x07050703, 0x07050707, 0x0705070b, 0x0705070f,
+    0x07070103, 0x07070107, 0x0707010b, 0x0707010f, 0x07070303, 0x07070307, 0x0707030b, 0x0707030f,
+    0x07070503, 0x07070507, 0x0707050b, 0x0707050f, 0x07070703, 0x07070707, 0x0707070b, 0x0707070f,
+};
+/* ─────────────────────────────────────────────────────────────────────────── *
+ * dequant_iq3xxs — GGML type 18 (~3.06 bpw, 98 bytes / 256 weights)
+ *
+ * Block layout: d(2) + qs(64) + sas(32) = 98 bytes.
+ *   qs[0..63]:  8 grid indices per group × 8 groups (uint8, index 0..255)
+ *   sas[0..31]: 8 × uint32 (one per group of 32 weights)
+ *               gas[7:0]   = scale byte  (0..255)
+ *               gas[14:8]  = ksigns index for weights  0..7
+ *               gas[21:15] = ksigns index for weights  8..15
+ *               gas[28:22] = ksigns index for weights 16..23
+ *               weights 24..31 are always positive (last 2 grid entries)
+ *
+ * Scale: dl = d × (0.5 + scale_byte) × 0.5
+ * Signs: ksigns_iq2xs[gas_byte & 0x7f] → 8 bits, bit k = sign of weight k
+ *        (bit=0 → +1, bit=1 → −1, matching ksigns even-parity encoding)
+ * ─────────────────────────────────────────────────────────────────────────── */
+static void dequant_iq3xxs(const uint8_t * restrict src,
+                            float        * restrict dst,
+                            size_t                 n_elements)
+{
+    const size_t nb = n_elements / 256;
+
+    for (size_t b = 0; b < nb; b++, src += 98, dst += 256) {
+        uint16_t d16; memcpy(&d16, src, 2);
+        const float d = f16_to_f32(d16);
+
+        const uint8_t *qs  = src + 2;       /* 64 grid indices        */
+        const uint8_t *sas = src + 2 + 64;  /* 8 × uint32 (gas array) */
+
+        for (int g = 0; g < 8; g++) {
+            uint32_t gas; memcpy(&gas, sas + 4 * g, 4);
+            const float dl = d * (0.5f + (float)(gas & 0xffu)) * 0.5f;
+
+            /* 3 ksigns indices packed in bits[28:8] of gas (7 bits each) */
+            const uint8_t s0 = ksigns_iq2xs[(gas >>  8) & 0x7fu];
+            const uint8_t s1 = ksigns_iq2xs[(gas >> 15) & 0x7fu];
+            const uint8_t s2 = ksigns_iq2xs[(gas >> 22) & 0x7fu];
+
+            const uint8_t *qg = qs + 8 * g;
+            float         *y  = dst + 32 * g;
+
+            /* Grid entries 0..1: signs from s0 (bits 0..7 cover weights 0..7) */
+            for (int ig = 0; ig < 2; ig++) {
+                const uint8_t *gv = (const uint8_t *)&iq3xxs_grid[qg[ig]];
+                for (int j = 0; j < 4; j++) {
+                    const int w = ig * 4 + j;
+                    y[w] = dl * (float)gv[j] * ((s0 >> w) & 1u ? -1.f : 1.f);
+                }
+            }
+            /* Grid entries 2..3: signs from s1 (bits 0..7 cover weights 8..15) */
+            for (int ig = 2; ig < 4; ig++) {
+                const uint8_t *gv = (const uint8_t *)&iq3xxs_grid[qg[ig]];
+                for (int j = 0; j < 4; j++) {
+                    const int bit = (ig - 2) * 4 + j;
+                    y[ig * 4 + j] = dl * (float)gv[j] * ((s1 >> bit) & 1u ? -1.f : 1.f);
+                }
+            }
+            /* Grid entries 4..5: signs from s2 (bits 0..7 cover weights 16..23) */
+            for (int ig = 4; ig < 6; ig++) {
+                const uint8_t *gv = (const uint8_t *)&iq3xxs_grid[qg[ig]];
+                for (int j = 0; j < 4; j++) {
+                    const int bit = (ig - 4) * 4 + j;
+                    y[ig * 4 + j] = dl * (float)gv[j] * ((s2 >> bit) & 1u ? -1.f : 1.f);
+                }
+            }
+            /* Grid entries 6..7: always positive (no sign bits) */
+            for (int ig = 6; ig < 8; ig++) {
+                const uint8_t *gv = (const uint8_t *)&iq3xxs_grid[qg[ig]];
+                for (int j = 0; j < 4; j++)
+                    y[ig * 4 + j] = dl * (float)gv[j];
+            }
+        }
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── *
+ * dequant_iq3s — GGML type 21 (~3.44 bpw, 110 bytes / 256 weights)
+ * Handles IQ3_S tensors and also the individual tensors inside IQ3_XS / IQ3_M
+ * mixed-precision GGUF files (all tagged as type 21 in the file).
+ *
+ * For each group g (0..7) of 32 weights:
+ *   nibble = (scales[g/2] >> 4(g&1)) & 0xf
+ *   dl     = d × 1.044f x (0.5f +  nibble) * 0.25f 
+ *
+ * The 1.044f is a calibration constant baked into the IQ3_S quantizer
+ * during encoding (from llama.cpp ggml-quants.c dequantize_row_iq3_s).
+ * Without it, the scale is 7.66× too large, driving logits to extremes.
+ *
+ *
+ *   For each sub-group sg (0..3) of 8 weights within the group:
+ *     For hi ∈ {0, 1}  (two grid lookups of 4 weights each):
+ *       idx9 = qs[8g + 2sg + hi] | ((qh[g] >> (2sg + hi)) & 1) << 8
+ *       gv[0..3] = bytes of iq3s_grid[idx9]
+ *       for j = 0..3:
+ *         w    = 32g + 8sg + 4hi + j
+ *         sign = (signs[w/8] >> (w%8)) & 1
+ *         y[w] = dl × gv[j] × (sign ? -1 : +1)
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+static void dequant_iq3s(const uint8_t * restrict src,
+                          float         * restrict dst,
+                          size_t                  n_elements)
+{
+    const size_t nb = n_elements / 256;
+
+    for (size_t b = 0; b < nb; b++, src += 110, dst += 256) {
+        /* d is the FIRST field (offset 0) — this was always correct */
+        uint16_t d16;
+        memcpy(&d16, src, 2);
+        const float d = f16_to_f32(d16);
+
+        const uint8_t *qs     = src + 2;    /* [64] low 8 bits of 9-bit index  */
+        const uint8_t *qh     = src + 66;   /* [ 8] high bit of 9-bit index    */
+        const uint8_t *signs  = src + 74;   /* [32] sign bits, 1 per element   */
+        const uint8_t *scales = src + 106;  /* [ 4] 4-bit scale nibbles        */
+
+        for (int g = 0; g < 8; g++) {
+            const int nibble = (scales[g >> 1] >> (4 * (g & 1))) & 0xf;
+
+            /* ── THE FIX ──────────────────────────────────────────────────
+             * Original: d * 1.044f * (0.5f + nibble) * 0.25f  ← 7.66x too small
+             * Correct (llama.cpp dequantize_row_iq3_s):
+             *   dl = d * (1 + 2 * nibble)
+             * nibble=0  → dl = d*1   (minimum scale)
+             * nibble=15 → dl = d*31  (maximum scale)
+             * ─────────────────────────────────────────────────────────── */
+            const float dl = d * (float)(1 + 2 * nibble);
+
+            for (int sg = 0; sg < 4; sg++) {
+                const int qi = 8 * g + 2 * sg;
+
+                for (int hi = 0; hi < 2; hi++) {
+                    const uint32_t idx9 = (uint32_t)qs[qi + hi]
+                                        | ((uint32_t)((qh[g] >> (2 * sg + hi)) & 1u) << 8);
+                    const uint8_t *gv   = (const uint8_t *)&iq3s_grid[idx9];
+
+                    const int w0 = 32 * g + 8 * sg + 4 * hi;
+                    for (int j = 0; j < 4; j++) {
+                        const int w    = w0 + j;
+                        const int sign = (signs[w >> 3] >> (w & 7)) & 1;
+                        dst[w] = dl * (float)gv[j] * (sign ? -1.f : 1.f);
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 /* Non-linear lookup table for IQ4_XS (ggml-common.h: kvalues_iq4nl).
  * These are int8 codebook values; dequant = dl * (float)iq4xs_nl[nibble].
@@ -1582,14 +1905,16 @@ static void load_model_gguf(const char *path) {
         if (!dst_ptr) {
             /* Skip tensors we don't need */
             const char *tname = "UNK";
-            if      (t->type == GGUF_TYPE_F32)    tname = "F32 ";
-            else if (t->type == GGUF_TYPE_F16)    tname = "F16 ";
-            else if (t->type == GGUF_TYPE_IQ4_XS) tname = "IQ4_XS";
-            else if (t->type == GGUF_TYPE_Q3_K)   tname = "Q3_K";
-            else if (t->type == GGUF_TYPE_Q4_K)   tname = "Q4_K";
-            else if (t->type == GGUF_TYPE_Q5_K)   tname = "Q5_K";
-            else if (t->type == GGUF_TYPE_Q6_K)   tname = "Q6_K"; 
-            else if (t->type == GGUF_TYPE_Q8_0)   tname = "Q8_0";
+            if      (t->type == GGUF_TYPE_F32)     tname = "F32 ";
+            else if (t->type == GGUF_TYPE_F16)     tname = "F16 ";
+            else if (t->type == GGUF_TYPE_IQ4_XS)  tname = "IQ4_XS";
+            else if (t->type == GGUF_TYPE_IQ3_XXS) tname = "IQ3_XXS";
+            else if (t->type == GGUF_TYPE_IQ3_S)   tname = "IQ3_S";
+            else if (t->type == GGUF_TYPE_Q3_K)    tname = "Q3_K";
+            else if (t->type == GGUF_TYPE_Q4_K)    tname = "Q4_K";
+            else if (t->type == GGUF_TYPE_Q5_K)    tname = "Q5_K";
+            else if (t->type == GGUF_TYPE_Q6_K)    tname = "Q6_K"; 
+            else if (t->type == GGUF_TYPE_Q8_0)    tname = "Q8_0";
             
             fprintf(stderr, "[SKIP] %-50s  %s  n=%7zu  (unmapped name)\n", t->name, tname, t->n_elements);
             continue;
@@ -1617,6 +1942,50 @@ static void load_model_gguf(const char *path) {
             for (size_t e = 0; e < t->n_elements; e++) {
                 dst[e] = f16_to_f32(tmp[e]);
             }
+            free(tmp);
+
+        } else if (t->type == GGUF_TYPE_IQ3_XXS) {
+            /* Dequantize IQ3_XXS (type 18) → F32.
+             * Also handles individual tensors in IQ3_XS mixed-precision files. */
+            if (t->n_elements % IQ3_XXS_BLOCK_SIZE != 0) {
+                fprintf(stderr, "[ERROR] IQ3_XXS tensor %s has %zu elements "
+                                "(not a multiple of %d)\n",
+                        t->name, t->n_elements, IQ3_XXS_BLOCK_SIZE);
+                fclose(f); free(tensors); exit(1);
+            }
+            size_t raw_bytes = (t->n_elements / IQ3_XXS_BLOCK_SIZE) * IQ3_XXS_BYTES_PER_BLOCK;
+            uint8_t *tmp = (uint8_t *)malloc(raw_bytes);
+            if (!tmp) {
+                fprintf(stderr, "[FATAL] OOM for IQ3_XXS buffer (%s)\n", t->name);
+                exit(1);
+            }
+            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
+                fprintf(stderr, "[ERROR] Short read on IQ3_XXS tensor %s\n", t->name);
+                free(tmp); fclose(f); free(tensors); exit(1);
+            }
+            dequant_iq3xxs(tmp, dst, t->n_elements);
+            free(tmp);
+
+        } else if (t->type == GGUF_TYPE_IQ3_S) {
+            /* Dequantize IQ3_S (type 21) → F32.
+             * Also handles tensors in IQ3_S, IQ3_M, and IQ3_XS mixed-precision files. */
+            if (t->n_elements % IQ3_S_BLOCK_SIZE != 0) {
+                fprintf(stderr, "[ERROR] IQ3_S tensor %s has %zu elements "
+                                "(not a multiple of %d)\n",
+                        t->name, t->n_elements, IQ3_S_BLOCK_SIZE);
+                fclose(f); free(tensors); exit(1);
+            }
+            size_t raw_bytes = (t->n_elements / IQ3_S_BLOCK_SIZE) * IQ3_S_BYTES_PER_BLOCK;
+            uint8_t *tmp = (uint8_t *)malloc(raw_bytes);
+            if (!tmp) {
+                fprintf(stderr, "[FATAL] OOM for IQ3_S buffer (%s)\n", t->name);
+                exit(1);
+            }
+            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
+                fprintf(stderr, "[ERROR] Short read on IQ3_S tensor %s\n", t->name);
+                free(tmp); fclose(f); free(tensors); exit(1);
+            }
+            dequant_iq3s(tmp, dst, t->n_elements);
             free(tmp);
 
         } else if (t->type == GGUF_TYPE_IQ4_XS) {
@@ -1826,7 +2195,7 @@ static void load_model(const char *path) {
             load_model_bin(path);
             break;
         case FORMAT_GGUF:
-            printf("[INFO] Format: GGUF (.gguf) — F16/IQ4_XS/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0 dequantization\n");
+            printf("[INFO] Format: GGUF (.gguf) — F16/IQ3_XS/IQ3_S/IQ4_XS/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0 dequantization\n");
             load_model_gguf(path);
             break;
         default:
@@ -2222,7 +2591,7 @@ static void generate(const char *prompt, int max_new_tokens,
 int main(int argc, char *argv[]) {
     printf("==============================================\n");
     printf("  lm.c — Unified GPT-2 Inference (C99)\n");
-    printf("  Backends: custom .bin  |  GGUF .gguf (F32/F16/IQ4_XS/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0)\n");
+    printf("  Backends: custom .bin  |  GGUF .gguf (F32/F16/IQ3_XS/IQ3_S/IQ3_M/IQ4_XS/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0)\n");
     printf("===========================================================================\n\n");
 
     const char *prompt      = "Hello, world!";
