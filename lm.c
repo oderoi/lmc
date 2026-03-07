@@ -4,19 +4,21 @@
  *          Architecture parameters are read at runtime from model files.
  *
  * Supports TWO model formats, auto-detected by file extension / magic:
- *   1. gpt2_124m.bin / gpt2_medium.bin     — custom binary format (float32, little-endian)
- *   2. *.gguf                              — GGUF format (llama.cpp compatible)
- *        Supported quant types:    F32, F16, Q4_K (S+M), Q5_K (S+M), Q6_K, Q8_0,
+ *   1. *.bin     
+            custom binary format (float32, little-endian)
+ *   2. *.gguf                              
+ *          — GGUF format (llama.cpp compatible)
+ *          Supported quant types:  F32, F16, Q4_K (S+M), Q5_K (S+M), Q6_K, Q8_0,
  *                                  Q2_K, Q3_K, IQ3_XS, IQ4_XS
  *        
  *
- * Architecture support:
- * ---------------------
- *      - GPT-2 Small (124M): 12L ~ transformer layers, 12H ~ attention heads, D=768 ~ embedding dimesion
- *      - GPT-2 Medium (345M): 24L ~ transformer layers, 16H ~ attention heads, D=1024 ~ embedding dimension
- *      Both share:
- *      -----------
- *      - 3072 FFN hidden dimension, 50257 vocabulary size, 1024 max sequence length
+ * Architecture support:      
+ *      GPT-2 Small     (124M): 12L ~ transformer layers, 12H ~ attention heads, D=768  ~ embedding dimesion
+ *      GPT-2 Medium    (345M): 24L ~ transformer layers, 16H ~ attention heads, D=1024 ~ embedding dimension
+ *      GPT-2 Large     (774M): 12L ~ transformer layers, 20H ~ attention heads, D=1280 ~ embedding dimesion
+ *      GPT-2 XL        (1.5B): 48L ~ transformer layers, 25H ~ attention heads, D=1600 ~ embedding dimension
+ *      
+ *      (head_dim = 64, vocabulary size = 50257,  max sequence length = 1024)
  *
  * Compile (single-threaded):
  *      gcc -O3 -march=native -ffast-math lm.c -o lm -lm
@@ -83,20 +85,9 @@ static ModelConfig g_cfg;   /* zero-initialised; filled by load_model_* */
 /* ============================================================
  * STATIC LIMITS (kept for static array sizing only)
  * ============================================================ */
-#define MAX_N_LAYERS        48   /* enough for GPT-2 XL (48) and below */
+#define MAX_N_LAYERS        48      /* enough for GPT-2 XL (48) and below */
 #define MAX_VOCAB_SIZE      50257
 #define MAX_SEQ_LEN         1024
-
-/* ============================================================
- * GPT-2 124M HYPERPARAMETERS
- * ============================================================ */
-//#define GPT2_VOCAB_SIZE   50257   /* VOCAB_SIZE */
-//#define GPT2_SEQ_LEN      1024
-//#define GPT2_N_LAYERS     12
-//#define GPT2_N_HEADS      12
-//#define GPT2_EMBED_DIM    768
-//#define GPT2_FFN_DIM      3072    /* 4 * EMBED_DIM */
-//#define GPT2_HEAD_DIM     64      /* EMBED_DIM / N_HEADS */
 
 /* ============================================================
  * BINARY MODEL FILE MAGIC & VERSION (custom .bin format)
@@ -330,12 +321,12 @@ typedef struct {
 } LayerWeights;
 
 typedef struct {
-    float           *wte;               /* [VOCAB_SIZE, EMBED_DIM] token embeddings     */
-    float           *wpe;               /* [SEQ_LEN, EMBED_DIM]    position embeddings  */
+    float           *wte;               /* [vocab_size, embed_dim] token embeddings     */
+    float           *wpe;               /* [seq_len, embed_dim]    position embeddings  */
     LayerWeights    *layers;            /* [n_layers]   - heap-allocated                */
-    float           *ln_f_weight;       /* [EMBED_DIM]                                  */
-    float           *ln_f_bias;         /* [EMBED_DIM]                                  */
-    float           *lm_head;           /* [VOCAB_SIZE, EMBED_DIM] LM head weights.
+    float           *ln_f_weight;       /* [embed_dim]                                  */
+    float           *ln_f_bias;         /* [embed_dim                                  */
+    float           *lm_head;           /* [vocab_size, embed_dim] LM head weights.
                                          * For .bin (tied weights): same pointer as wte.
                                          * For GGUF: points to output.weight if present,
                                          * otherwise falls back to wte (tied).          */
@@ -355,16 +346,16 @@ typedef struct {
  * All sized at runtime from g_cfg
  * ============================================================ */
 typedef struct {
-    float *x;            /* [EMBED_DIM]              */
-    float *x_norm;       /* [EMBED_DIM]              */
-    float *qkv;          /* [3*EMBED_DIM]            */
-    float *attn_out;     /* [EMBED_DIM]              */
-    float *proj_out;     /* [EMBED_DIM] (FIX #3)     */
-    float *ffn_hidden;   /* [FFN_DIM]                */
-    float *ffn_out;      /* [EMBED_DIM] (FIX #3)     */
-    float *logits;       /* [VOCAB_SIZE]             */
-    float *attn_scores;  /* [N_HEADS * SEQ_LEN]      */
-    void  *sorted_buf;   /* for top-p (FIX #5)       */
+    float *x;            /* [embed_dim]             */
+    float *x_norm;       /* [embed_dim]             */
+    float *qkv;          /* [3*embed_dim]           */
+    float *attn_out;     /* [embed_dim]             */
+    float *proj_out;     /* [embed_dim]             */
+    float *ffn_hidden;   /* [ffn_dim]               */
+    float *ffn_out;      /* [embed_dim]             */
+    float *logits;       /* [vocab_size]            */
+    float *attn_scores;  /* [n_heads * seq_len]     */
+    void  *sorted_buf;   /* for top-p               */
 } Activations;
 
 /* ============================================================
@@ -464,7 +455,6 @@ static void get_scale_min_k4(int j, const uint8_t *scales, uint8_t *out_sc, uint
 /* ============================================================
  * DEQUANTIZATION HELPERS
  * ============================================================ */
-
 /*
  * ------— dequant_q2k function
  * -------------------------------------------------------------------------
@@ -1659,6 +1649,7 @@ static void assign_weight_pointers(void) {
     g_weights.ln_f_weight = arena_alloc(D);
     g_weights.ln_f_bias   = arena_alloc(D);
 }
+
 /* ============================================================
  * BACKEND 1: CUSTOM FLOAT32 BINARY FORMAT (.bin)
  *
@@ -1704,8 +1695,7 @@ static void load_model_bin(const char *path) {
     g_cfg.ffn_dim    = 4 * (int)embed_dim;      /* GPT-2 always 4x */
     g_cfg.head_dim   = (int)embed_dim / (int)n_heads;
 
-    printf("[INFO] Architecture: L=%d H=%d D=%d F=%d Dh=%d V=%d S=%d\n",
-           CFG_L, CFG_H, CFG_D, CFG_F, CFG_Dh, CFG_V, CFG_S);
+    printf("[INFO] Architecture: L=%d H=%d D=%d F=%d Dh=%d V=%d S=%d\n", CFG_L, CFG_H, CFG_D, CFG_F, CFG_Dh, CFG_V, CFG_S);
 
     size_t total = gpt2_total_params();
     printf("[INFO] Parameters: %zu  (%.1f MB)\n", total, total*4.0/(1024*1024));
@@ -1722,7 +1712,6 @@ static void load_model_bin(const char *path) {
     fclose(f);
     printf("[INFO] Loaded (float32 .bin): %s\n", path);
 }
-
 
 /* ============================================================
  * BACKEND 2: GGUF FORMAT (.gguf) WITH F16 WEIGHTS
@@ -1824,9 +1813,36 @@ static void gguf_skip_value(FILE *f, uint32_t vtype) {
     }
 }
 
-/* Descriptor for one tensor in the GGUF file */
-#define GGUF_MAX_TENSORS 512
-#define GGUF_MAX_DIMS      4
+/*
+ * Tensor counts per GPT-2 variant.
+ *
+ * Per-layer tensors (12 per layer):
+ *   attn_norm.weight/bias, attn_qkv.weight/bias,
+ *   attn_output.weight/bias, ffn_norm.weight/bias,
+ *   ffn_up.weight/bias, ffn_down.weight/bias
+ *
+ * Global tensors (5):
+ *   token_embd.weight, position_embd.weight,
+ *   output_norm.weight/bias, output.weight
+ *
+ *   Variant | Layers | Formula     |  Total
+ *   --------+--------+-------------+------
+ *   Small   |    12  | 12×12 + 5   |   149
+ *   Medium  |    24  | 24×12 + 5   |   293
+ *   Large   |    36  | 36×12 + 5   |   437
+ *   XL      |    48  | 48×12 + 5   |   581
+ *
+ * GGUF_TENSORS_PER_LAYER / GGUF_TENSORS_GLOBAL are used after
+ * g_cfg.n_layers is populated to compute the exact expected count
+ * at runtime, replacing the old single magic GGUF_MAX_TENSORS value.
+ */
+#define GGUF_TENSORS_PER_LAYER  12
+#define GGUF_TENSORS_GLOBAL     5
+#define GGUF_TENSORS_SMALL      149     /* 12 * 12 + 5 */
+#define GGUF_TENSORS_MEDIUM     293     /* 24 * 12 + 5 */
+#define GGUF_TENSORS_LARGE      437     /* 36 * 12 + 5 */
+#define GGUF_TENSORS_XL         581     /* 48 * 12 + 5 */
+#define GGUF_MAX_DIMS           4
 typedef struct {
     char     name[256];
     uint32_t type;
@@ -1957,10 +1973,30 @@ static void load_model_gguf(const char *path) {
     else if (CFG_L == 48 && CFG_D == 1600) printf("[INFO] Model variant: GPT-2 XL    (1.5B)\n");
     else                                   printf("[INFO] Model variant: Custom (%dL/%dD)\n", CFG_L, CFG_D);
 
-    /* ---- Read tensor info descriptors ---- */
-    if (n_tensors > GGUF_MAX_TENSORS) {
-        fprintf(stderr,"[ERROR] Too many tensors (%llu > %d)\n",
-                (unsigned long long)n_tensors, GGUF_MAX_TENSORS);
+    /* ---- Read tensor descriptors ---- */
+    /*
+     * Compute expected tensor count from the architecture we just read.
+     * Formula: n_layers * GGUF_TENSORS_PER_LAYER + GGUF_TENSORS_GLOBAL
+     *
+     *   Small  (12L):  12 * 12 + 5 = 149 = GGUF_TENSORS_SMALL
+     *   Medium (24L):  24 * 12 + 5 = 293 = GGUF_TENSORS_MEDIUM
+     *   Large  (36L):  36 * 12 + 5 = 437 = GGUF_TENSORS_LARGE
+     *   XL     (48L):  48 * 12 + 5 = 581 = GGUF_TENSORS_XL
+     *
+     * We allow a small slack (+4) for optional/extra tensors that some
+     * converters add (e.g. rope_freqs, extra norms). The allocation is
+     * always calloc(n_tensors) so no memory is wasted regardless.
+     */    
+    const int expected_tensors  =   CFG_L * GGUF_TENSORS_PER_LAYER + GGUF_TENSORS_GLOBAL;
+    const int max_tensors       =   expected_tensors + 4;       /* slackfor converter extras */
+    printf("[INFO] Expected tensors: %d (L%d x %d per-layer + %d global)\n", expected_tensors, CFG_L, GGUF_TENSORS_PER_LAYER, GGUF_TENSORS_GLOBAL);
+    if ((int)n_tensors > max_tensors) {
+        fprintf(stderr,"[ERROR] Too many tensors (%llu > %d for %dL model)\n",(unsigned long long)n_tensors, expected_tensors, CFG_L);
+        fprintf(stderr, "   Per-model expected counts:\n");
+        fprintf(stderr, "   Small  (12L): %d\n", GGUF_TENSORS_SMALL);
+        fprintf(stderr, "   Medium (24L): %d\n", GGUF_TENSORS_MEDIUM);
+        fprintf(stderr, "   Large  (36L): %d\n", GGUF_TENSORS_LARGE);
+        fprintf(stderr, "   XL     (48L): %d\n", GGUF_TENSORS_XL);
         fclose(f); exit(1);
     }
     GGUFTensor *tensors = (GGUFTensor*)calloc(n_tensors, sizeof(GGUFTensor));
@@ -2128,9 +2164,12 @@ static ModelFormat detect_format(const char *path) {
 
 static const char* find_default_model(void) {
     static const char *candidates[] = {
-        "gpt2_124m.bin", "gpt2_medium.bin",
-        "gpt2.f16.gguf", "gpt2.gguf",
+        "gpt2_124m.bin",        "gpt2_medium.bin",
+        "gpt2_large.bin",       "gpt2_xl.bin",
+        "gpt2.f16.gguf",        "gpt2.gguf",
         "gpt2-medium.f16.gguf", "gpt2-medium.gguf",
+        "gpt2-large.f16.gguf",  "gpt2-large.gguf",
+        "gpt2-xl.f16.gguf",     "gpt2-xl.gguf",        
         NULL
     };
     for (int i = 0; candidates[i]; i++) {
@@ -2492,9 +2531,12 @@ int main(int argc, char *argv[]) {
         if (!model_path) {
             fprintf(stderr,
                 "[ERROR] No model file found.\n"
-                "  Tried: gpt2_124m.bin, gpt2_medium.bin, gpt2.f16.gguf, gpt2.gguf,\n"
-                "         gpt2-medium.f16.gguf, gpt2-medium.gguf\n"
-                "  Or pass: --model <path>\n");
+                "  Tried: gpt2_124m.bin, gpt2_medium.bin, gpt2_large.bin, gpt2_xl.bin,\n"
+                "         gpt2.f16.gguf, gpt2.gguf,\n"
+                "         gpt2-medium.f16.gguf, gpt2-medium.gguf,\n"
+                "         gpt2-large.f16.gguf,  gpt2-large.gguf,\n"
+                "         gpt2-xl.f16.gguf,     gpt2-xl.gguf\n"
+                "  Or pass: --model <path>\n");            
             return 1;
         }
     }
