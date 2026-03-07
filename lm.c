@@ -1,29 +1,36 @@
 /*
- * lm.c — Unified GPT-2 124M inference engine in pure C99
+ * lm.c —   Unified GPT-2 inference engine in pure C99
+ *          Supports GPT-2 Small (124M) and GPT-2 Medium (345M).
+ *          Architecture parameters are read at runtime from model files.
  *
  * Supports TWO model formats, auto-detected by file extension / magic:
- *   1. gpt2_124m.bin      — custom binary format (float32, little-endian)
- *   2. *.gguf             — GGUF format (llama.cpp compatible)
- *        Supported quant types: F32, F16, Q4_K (S+M), Q5_K (S+M), Q6_K, Q8_0,
- *        Examples: gpt2.f16.gguf, gpt2.Q8_0.gguf, gpt2.Q4_K_M.gguf
+ *   1. gpt2_124m.bin / gpt2_medium.bin     — custom binary format (float32, little-endian)
+ *   2. *.gguf                              — GGUF format (llama.cpp compatible)
+ *        Supported quant types:    F32, F16, Q4_K (S+M), Q5_K (S+M), Q6_K, Q8_0,
+ *                                  Q2_K, Q3_K, IQ3_XS, IQ4_XS
+ *        
  *
- * Architecture: GPT-2 124M
- *   - 12 transformer layers, 12 attention heads
- *   - 768 embedding dimension, 3072 FFN hidden dimension
- *   - 50257 vocabulary size, 1024 max sequence length
+ * Architecture support:
+ * ---------------------
+ *      - GPT-2 Small (124M): 12L ~ transformer layers, 12H ~ attention heads, D=768 ~ embedding dimesion
+ *      - GPT-2 Medium (345M): 24L ~ transformer layers, 16H ~ attention heads, D=1024 ~ embedding dimension
+ *      Both share:
+ *      -----------
+ *      - 3072 FFN hidden dimension, 50257 vocabulary size, 1024 max sequence length
  *
  * Compile (single-threaded):
- *   gcc -O3 -march=native -ffast-math lm.c -o lm -lm
+ *      gcc -O3 -march=native -ffast-math lm.c -o lm -lm
  *
  * Compile (OpenMP multi-threaded):
- *   gcc -O3 -march=native -ffast-math -fopenmp lm.c -o lm -lm
+ *      
+ *      gcc -O3 -march=native -ffast-math -fopenmp lm.c -o lm -lm
  *
  * Usage:
  *   ./lm "Your prompt" [max_tokens] [temperature] [top_p] --model [model]
  *
  *   The model file is auto-detected:
- *     - Checks for gpt2_124m.bin  first  (float32 custom format)
- *     - Falls back to gpt2.f16.gguf      (GGUF FP16 format)
+ *      - Checks for gpt2_124m.bin  first  (float32 custom format)
+ *      - Falls back to gpt2.f16.gguf      (GGUF FP16 format)
  *   Or pass an explicit path as the first argument ending in .bin / .gguf.
  */
 
@@ -47,40 +54,92 @@
  * ============================================================ */
 typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
 
+/* ================================================================
+ * RUNTIME ARCHITECTURE CONFIG
+ * Replaces compile-time #defines, Populate from model file headers
+ * ================================================================ */
+typedef struct {
+    int vocab_size;     /* 50257 for all GPT-2 variants     */
+    int seq_len;        /* 1024 for all GPT-2 variants      */
+    int n_layers;       /* 12 (small) or 24 (medium)        */
+    int n_heads;        /* 12 (small) or 16 (medium)        */
+    int embed_dim;      /* 768 (small) or 1024 (medium)     */
+    int ffn_dim;        /* 3072 (small* or 4096 (medium)    */
+    int head_dim;       /* embed_dim / n_heads - always 64  */
+} ModelConfig;
+
+static ModelConfig g_cfg;   /* zero-initialised; filled by load_model_* */
+
+/* Convenience accessors - avoids typos, matches old GPT2_* names */
+#define CFG_V   g_cfg.vocab_size
+#define CFG_S   g_cfg.seq_len
+#define CFG_L   g_cfg.n_layers
+#define CFG_H   g_cfg.n_heads
+#define CFG_D   g_cfg.embed_dim
+#define CFG_F   g_cfg.ffn_dim
+#define CFG_Dh  g_cfg.head_dim
+
+
+/* ============================================================
+ * STATIC LIMITS (kept for static array sizing only)
+ * ============================================================ */
+#define MAX_N_LAYERS        48   /* enough for GPT-2 XL (48) and below */
+#define MAX_VOCAB_SIZE      50257
+#define MAX_SEQ_LEN         1024
+
 /* ============================================================
  * GPT-2 124M HYPERPARAMETERS
  * ============================================================ */
-#define GPT2_VOCAB_SIZE   50257
-#define GPT2_SEQ_LEN      1024
-#define GPT2_N_LAYERS     12
-#define GPT2_N_HEADS      12
-#define GPT2_EMBED_DIM    768
-#define GPT2_FFN_DIM      3072   /* 4 * EMBED_DIM */
-#define GPT2_HEAD_DIM     64     /* EMBED_DIM / N_HEADS */
+//#define GPT2_VOCAB_SIZE   50257   /* VOCAB_SIZE */
+//#define GPT2_SEQ_LEN      1024
+//#define GPT2_N_LAYERS     12
+//#define GPT2_N_HEADS      12
+//#define GPT2_EMBED_DIM    768
+//#define GPT2_FFN_DIM      3072    /* 4 * EMBED_DIM */
+//#define GPT2_HEAD_DIM     64      /* EMBED_DIM / N_HEADS */
 
 /* ============================================================
  * BINARY MODEL FILE MAGIC & VERSION (custom .bin format)
  * ============================================================ */
-#define MODEL_MAGIC   0x47505432U  /* "GPT2" */
-#define MODEL_VERSION 1
+#define MODEL_MAGIC         0x47505432U  /* "GPT2" */
+#define MODEL_VERSION       1
 
 /* ============================================================
  * GGUF FORMAT CONSTANTS
  * ============================================================ */
-#define GGUF_MAGIC        0x46554747U  /* "GGUF" little-endian */
-#define GGUF_VERSION_MIN  1
-#define GGUF_VERSION_MAX  3
+#define GGUF_MAGIC          0x46554747U  /* "GGUF" little-endian */
+#define GGUF_VERSION_MIN    1
+#define GGUF_VERSION_MAX    3
 
 /* GGUF tensor type IDs we care about */
-#define GGUF_TYPE_F32      0
-#define GGUF_TYPE_F16      1
-#define GGUF_TYPE_Q8_0     8   /* 8-bit quantization, block size 32            */
-#define GGUF_TYPE_Q4_K     12  /* 4-bit K-quant, super-block size 256          */
-#define GGUF_TYPE_IQ4_XS   23  /* 4-bit non-linear quant, block size 256       */
-#define GGUF_TYPE_IQ3_XXS  18  /* 3-bit non-linear quant, block size 256 (~3.06 bpw) */
-#define GGUF_TYPE_IQ3_S    21  /* 3-bit non-linear quant, block size 256 (~3.44 bpw) */
-#define GGUF_TYPE_Q6_K     14  /* 6-bit K-quant, super-block size 256          */
-#define GGUF_TYPE_Q3_K     11  /* 3-bit K-quant, super-block size 256          */
+#define GGUF_TYPE_F32       0
+#define GGUF_TYPE_F16       1
+#define GGUF_TYPE_Q8_0      8   /* 8-bit quantization, block size 32            */
+#define GGUF_TYPE_Q6_K      14  /* 6-bit K-quant, super-block size 256          */
+#define GGUF_TYPE_Q5_K      13
+#define GGUF_TYPE_Q4_K      12  /* 4-bit K-quant, super-block size 256          */
+#define GGUF_TYPE_IQ4_XS    23  /* 4-bit non-linear quant, block size 256       */
+#define GGUF_TYPE_IQ3_XXS   18  /* 3-bit non-linear quant, block size 256 (~3.06 bpw) */
+#define GGUF_TYPE_IQ3_S     21  /* 3-bit non-linear quant, block size 256 (~3.44 bpw) */
+#define GGUF_TYPE_Q3_K      11  /* 3-bit K-quant, super-block size 256          */
+#define GGUF_TYPE_Q2_K      10  /* 2-bit K-quant, super-block size 256          */
+
+/*
+ * Q2_K block layout (84 bytes per super-block of 256 elements):
+ *   scales [16]  4-bit packed scale + min pairs:
+ *                  lo nibble (& 0x0F) = scale for sub-block
+ *                  hi nibble (>> 4)   = min  for sub-block
+ *                  16 sub-blocks of 16 elements → 16 bytes
+ *   qs     [64]  2-bit quantized values, 4 packed per byte:
+ *                  element e → (qs[e/4] >> (2*(e%4))) & 3
+ *                  BUT the packing order is NOT sequential (see dequant_q2k)
+ *   d      [ 2]  float16 super-block scale  (offset 80)
+ *   dmin   [ 2]  float16 super-block min    (offset 82)
+ *   TOTAL = 84 bytes
+ */
+#define Q2_K_BLOCK_SIZE         256
+#define Q2_K_BYTES_PER_BLOCK    84   /* 16 + 64 + 2 + 2 */
+
 
 /* -- Q3_K ------------------------------------------------------------------
  * Block layout (110 bytes per super-block of 256 elements):
@@ -108,12 +167,12 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
  * Q3_K_S, Q3_K_M, and Q3_K_L all share the same binary format (type ID 11).
  * The S/M/L suffix only affects the quantization strategy used during encoding.
  */
-#define Q3_K_BLOCK_SIZE      256
-#define Q3_K_HMASK_BYTES      32  /* high bits: 1 per element, 8/byte          */
-#define Q3_K_QS_BYTES         64  /* low 2 bits: 2 bits/element, 4/byte        */
-#define Q3_K_SC_BYTES         12  /* 6-bit scales for 16 sub-blocks            */
-#define Q3_K_D_BYTES           2  /* float16 super-block scale                 */
-#define Q3_K_BYTES_PER_BLOCK 110  /* 32+64+12+2                                */
+#define Q3_K_BLOCK_SIZE         256
+#define Q3_K_HMASK_BYTES        32  /* high bits: 1 per element, 8/byte          */
+#define Q3_K_QS_BYTES           64  /* low 2 bits: 2 bits/element, 4/byte        */
+#define Q3_K_SC_BYTES           12  /* 6-bit scales for 16 sub-blocks            */
+#define Q3_K_D_BYTES            2  /* float16 super-block scale                 */
+#define Q3_K_BYTES_PER_BLOCK    110  /* 32+64+12+2                                */
 
 /* -- Q4_K ------------------------------------------------------------------
  * Block layout (144 bytes per super-block of 256 elements):
@@ -135,25 +194,24 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
  *
  * Q4_K_S and Q4_K_M share the same binary format (type ID 12).
  */
-#define Q4_K_BLOCK_SIZE       256
-#define Q4_K_BYTES_PER_BLOCK  144   /* 2+2+12+128 */
+#define Q4_K_BLOCK_SIZE         256
+#define Q4_K_BYTES_PER_BLOCK    144   /* 2+2+12+128 */
 
-#define IQ4_XS_BLOCK_SIZE      256
-#define IQ4_XS_BYTES_PER_BLOCK 136  /* 2 (f16 d) + 4 (scales_h) + 4 (scales_l) + 128 (qs) */
+#define IQ4_XS_BLOCK_SIZE       256
+#define IQ4_XS_BYTES_PER_BLOCK  136  /* 2 (f16 d) + 4 (scales_h) + 4 (scales_l) + 128 (qs) */
 
 #define IQ3_XXS_BLOCK_SIZE      256
-#define IQ3_XXS_BYTES_PER_BLOCK  98  /* 2 (f16 d) + 64 (qs) + 32 (sas)             */
+#define IQ3_XXS_BYTES_PER_BLOCK 98  /* 2 (f16 d) + 64 (qs) + 32 (sas)             */
 #define IQ3_S_BLOCK_SIZE        256
 #define IQ3_S_BYTES_PER_BLOCK   110  /* 2 (f16 d) + 64 (qs) + 8 (qh) + 32 (signs) + 4 (scales) */
-
 
 
 /* Q8_0 block layout (34 bytes per block of 32 elements):
  *   [uint16_t d (float16 scale)][int8_t qs[32]]
  * Dequantize: x[i] = qs[i] * f16_to_f32(d)
  */
-#define Q8_0_BLOCK_SIZE      32
-#define Q8_0_BYTES_PER_BLOCK 34   /* 2 (f16 scale) + 32 (int8 values) */
+#define Q8_0_BLOCK_SIZE         32
+#define Q8_0_BYTES_PER_BLOCK    34   /* 2 (f16 scale) + 32 (int8 values) */
 
 /* Q6_K block layout (210 bytes per super-block of 256 elements):
  *   ql[128]    lower 4 bits of each quant,  2 packed per byte
@@ -167,12 +225,12 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
  *   q_signed  = (lo4 | (hi2 << 4)) - 32          // range [-32, 31]
  *   result    = q_signed * scales[gi/16] * f16_to_f32(d)
  */
-#define GGUF_TYPE_Q5_K        13  /* 5-bit K-quant, super-block size 256, S and M variants */
+#define GGUF_TYPE_Q5_K        13    /* 5-bit K-quant, super-block size 256, S and M variants */
 #define Q5_K_BLOCK_SIZE      256
-#define Q5_K_QH_BYTES         32  /* high bits: 1 per element, 8/byte    */
-#define Q5_K_QS_BYTES        128  /* low nibbles: 4 bits/element, 2/byte */
-#define Q5_K_SC_BYTES         12  /* packed 6-bit scales+mins            */
-#define Q5_K_BYTES_PER_BLOCK 176  /* 2+2+12+32+128                       */
+#define Q5_K_QH_BYTES         32    /* high bits: 1 per element, 8/byte     */
+#define Q5_K_QS_BYTES        128    /* low nibbles: 4 bits/element, 2/byte  */
+#define Q5_K_SC_BYTES         12    /* packed 6-bit scales+mins             */
+#define Q5_K_BYTES_PER_BLOCK 176    /* 2+2+12+32+128                        */
 
 /* Q4_K block layout (144 bytes per super-block of 256 elements):
  *   d      [2]   float16 super-block scale
@@ -200,12 +258,12 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
  * the dequantization algorithm is identical for both variants.
  */
 
-#define Q6_K_BLOCK_SIZE      256
-#define Q6_K_QL_BYTES        128  /* lower 4 bits, 2/byte                   */
-#define Q6_K_QH_BYTES         64  /* upper 2 bits, 4/byte                   */
-#define Q6_K_SC_BYTES         16  /* int8 sub-block scales                  */
-#define Q6_K_D_BYTES           2  /* float16 super-block scale              */
-#define Q6_K_BYTES_PER_BLOCK 210  /* 128+64+16+2                            */
+#define Q6_K_BLOCK_SIZE         256
+#define Q6_K_QL_BYTES           128     /* lower 4 bits, 2/byte                   */
+#define Q6_K_QH_BYTES           64      /* upper 2 bits, 4/byte                   */
+#define Q6_K_SC_BYTES           16      /* int8 sub-block scales                  */
+#define Q6_K_D_BYTES            2       /* float16 super-block scale              */
+#define Q6_K_BYTES_PER_BLOCK    210     /* 128+64+16+2                            */
 
 /* GGUF metadata value types */
 #define GGUF_MTYPE_UINT8    0
@@ -218,9 +276,9 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
 #define GGUF_MTYPE_BOOL     7
 #define GGUF_MTYPE_STRING   8
 #define GGUF_MTYPE_ARRAY    9
-#define GGUF_MTYPE_UINT64  10
-#define GGUF_MTYPE_INT64   11
-#define GGUF_MTYPE_FLOAT64 12
+#define GGUF_MTYPE_UINT64   10
+#define GGUF_MTYPE_INT64    11
+#define GGUF_MTYPE_FLOAT64  12
 
 /* ============================================================
  * TOKENIZER CONSTANTS
@@ -234,7 +292,7 @@ typedef char assert_float32_is_4_bytes[(sizeof(float) == 4) ? 1 : -1];
  * MEMORY ARENA
  * ============================================================ */
 typedef struct {
-    float  *data;
+    float   *data;
     size_t  capacity;
     size_t  used;
 } Arena;
@@ -243,8 +301,7 @@ static Arena g_arena;
 
 static float* arena_alloc(size_t n) {
     if (g_arena.used + n > g_arena.capacity) {
-        fprintf(stderr, "[FATAL] Arena OOM: need %zu, have %zu\n",
-                n, g_arena.capacity - g_arena.used);
+        fprintf(stderr, "[FATAL] Arena OOM: need %zu, have %zu\n", n, g_arena.capacity - g_arena.used);
         exit(1);
     }
     float *ptr = g_arena.data + g_arena.used;
@@ -254,45 +311,48 @@ static float* arena_alloc(size_t n) {
 
 /* ============================================================
  * WEIGHT STRUCTURES
+ * NOTE:    layers is now a pointer, allocated dynamically in
+ *          assign_weight_pointers() based on g_cfg.n_layers.
  * ============================================================ */
 typedef struct {
-    float *ln1_weight;        /* [EMBED_DIM]           */
-    float *ln1_bias;          /* [EMBED_DIM]           */
-    float *qkv_weight;        /* [3*EMBED_DIM*EMBED_DIM] */
-    float *qkv_bias;          /* [3*EMBED_DIM]         */
-    float *attn_proj_weight;  /* [EMBED_DIM*EMBED_DIM] */
-    float *attn_proj_bias;    /* [EMBED_DIM]           */
-    float *ln2_weight;        /* [EMBED_DIM]           */
-    float *ln2_bias;          /* [EMBED_DIM]           */
-    float *ffn_fc_weight;     /* [FFN_DIM*EMBED_DIM]   */
-    float *ffn_fc_bias;       /* [FFN_DIM]             */
-    float *ffn_proj_weight;   /* [EMBED_DIM*FFN_DIM]   */
-    float *ffn_proj_bias;     /* [EMBED_DIM]           */
+    float *ln1_weight;        /* [EMBED_DIM]                */
+    float *ln1_bias;          /* [EMBED_DIM]                */
+    float *qkv_weight;        /* [3*EMBED_DIM*EMBED_DIM]    */
+    float *qkv_bias;          /* [3*EMBED_DIM]              */
+    float *attn_proj_weight;  /* [EMBED_DIM*EMBED_DIM]      */
+    float *attn_proj_bias;    /* [EMBED_DIM]                */
+    float *ln2_weight;        /* [EMBED_DIM]                */
+    float *ln2_bias;          /* [EMBED_DIM]                */
+    float *ffn_fc_weight;     /* [FFN_DIM*EMBED_DIM]        */
+    float *ffn_fc_bias;       /* [FFN_DIM]                  */
+    float *ffn_proj_weight;   /* [EMBED_DIM*FFN_DIM]        */
+    float *ffn_proj_bias;     /* [EMBED_DIM]                */
 } LayerWeights;
 
 typedef struct {
-    float       *wte;                    /* [VOCAB_SIZE, EMBED_DIM] token embeddings  */
-    float       *wpe;                    /* [SEQ_LEN, EMBED_DIM]    position embeddings */
-    LayerWeights layers[GPT2_N_LAYERS];
-    float       *ln_f_weight;            /* [EMBED_DIM]             */
-    float       *ln_f_bias;             /* [EMBED_DIM]             */
-    float       *lm_head;               /* [VOCAB_SIZE, EMBED_DIM] LM head weights.
-                                          * For .bin (tied weights): same pointer as wte.
-                                          * For GGUF: points to output.weight if present,
-                                          * otherwise falls back to wte (tied). */
+    float           *wte;               /* [VOCAB_SIZE, EMBED_DIM] token embeddings     */
+    float           *wpe;               /* [SEQ_LEN, EMBED_DIM]    position embeddings  */
+    LayerWeights    *layers;            /* [n_layers]   - heap-allocated                */
+    float           *ln_f_weight;       /* [EMBED_DIM]                                  */
+    float           *ln_f_bias;         /* [EMBED_DIM]                                  */
+    float           *lm_head;           /* [VOCAB_SIZE, EMBED_DIM] LM head weights.
+                                         * For .bin (tied weights): same pointer as wte.
+                                         * For GGUF: points to output.weight if present,
+                                         * otherwise falls back to wte (tied).          */
 } ModelWeights;
 
 /* ============================================================
  * KV CACHE
  * ============================================================ */
 typedef struct {
-    float *k_cache;  /* [N_LAYERS * SEQ_LEN * N_HEADS * HEAD_DIM] */
-    float *v_cache;
-    int    seq_len;
+    float   *k_cache;  /* [N_LAYERS * SEQ_LEN * N_HEADS * HEAD_DIM] */
+    float   *v_cache;
+    int     seq_len;
 } KVCache;
 
 /* ============================================================
  * ACTIVATION BUFFERS
+ * All sized at runtime from g_cfg
  * ============================================================ */
 typedef struct {
     float *x;            /* [EMBED_DIM]              */
@@ -319,16 +379,17 @@ typedef struct {
     int     len;
 } VocabEntry;
 
-typedef struct {
-    VocabEntry vocab[BPE_MAX_VOCAB];
-    int        vocab_size;
-    BPEMerge   merges[BPE_MAX_MERGES];
-    int        n_merges;
-    char       byte_encoder[256][8];
-    int        byte_decoder[0x400];
 #define VOCAB_HASH_SIZE 131072
-    int vocab_hash[VOCAB_HASH_SIZE];
-    int vocab_hash_next[BPE_MAX_VOCAB];
+
+typedef struct {
+    VocabEntry  vocab[BPE_MAX_VOCAB];
+    int         vocab_size;
+    BPEMerge    merges[BPE_MAX_MERGES];
+    int         n_merges;
+    char        byte_encoder[256][8];
+    int         byte_decoder[0x400];
+    int         vocab_hash[VOCAB_HASH_SIZE];
+    int         vocab_hash_next[BPE_MAX_VOCAB];
 } Tokenizer;
 
 /* ============================================================
@@ -403,6 +464,81 @@ static void get_scale_min_k4(int j, const uint8_t *scales, uint8_t *out_sc, uint
 /* ============================================================
  * DEQUANTIZATION HELPERS
  * ============================================================ */
+
+/*
+ * ------— dequant_q2k function
+ * -------------------------------------------------------------------------
+ *
+ * ── Q2_K element layout ──────────────────────────────────────────────────
+ *
+ * The 256 elements are decoded in two outer passes of 128 elements each
+ * (n = 0, 128).  Within each pass, 4 inner loops (j = 0..3) re-read the
+ * same 32 qs bytes with increasing bit shifts (0, 2, 4, 6), extracting one
+ * 2-bit level per element per pass.  Each j-step writes two sub-groups of
+ * 16 elements, consuming two scale bytes from scales[].
+ *
+ *   for n in {0, 128}:
+ *     q_base = qs + n/4          (n=0 → qs[0], n=128 → qs[32])
+ *     shift  = 0
+ *     for j in 0..3:
+ *       sc  = scales[is++]
+ *       dl  = d    * (sc & 0x0F)
+ *       ml  = dmin * (sc >> 4)
+ *       for l in 0..15: y[out++] = dl * ((q_base[l]    >> shift) & 3) - ml
+ *       sc  = scales[is++]
+ *       dl  = d    * (sc & 0x0F)
+ *       ml  = dmin * (sc >> 4)
+ *       for l in 0..15: y[out++] = dl * ((q_base[l+16] >> shift) & 3) - ml
+ *       shift += 2
+ *
+ * Verified: 256 elements, 16 scale bytes, 64 qs bytes consumed per block.
+ * Matches llama.cpp ggml-quants.c dequantize_row_q2_K (QK_K=256 path).
+ */
+
+static void dequant_q2k(const uint8_t *src, float *dst, size_t n_elements)
+{
+    const size_t nb = n_elements / Q2_K_BLOCK_SIZE;
+
+    for (size_t b = 0; b < nb; b++, src += Q2_K_BYTES_PER_BLOCK, dst += Q2_K_BLOCK_SIZE) {
+        const uint8_t *scales = src;       /* [16] lo=scale nibble, hi=min nibble */
+        const uint8_t *qs     = src + 16;  /* [64] 2-bit quants                  */
+        uint16_t d_raw, dmin_raw;
+        memcpy(&d_raw,    src + 80, 2);
+        memcpy(&dmin_raw, src + 82, 2);
+        const float d    = f16_to_f32(d_raw);
+        const float dmin = f16_to_f32(dmin_raw);
+
+        float *y = dst;
+        int    is = 0;  /* index into scales[] */
+
+        for (int n = 0; n < 256; n += 128) {
+            const uint8_t *q = qs + n / 4;   /* n=0 → qs+0, n=128 → qs+32 */
+            int shift = 0;
+
+            for (int j = 0; j < 4; j++) {
+                uint8_t sc;
+                float dl, ml;
+
+                /* First sub-group of 16: q[0..15] */
+                sc = scales[is++];
+                dl = d    * (float)(sc & 0x0F);
+                ml = dmin * (float)(sc >>    4);
+                for (int l = 0; l < 16; l++)
+                    *y++ = dl * (float)((q[l] >> shift) & 3) - ml;
+
+                /* Second sub-group of 16: q[16..31] */
+                sc = scales[is++];
+                dl = d    * (float)(sc & 0x0F);
+                ml = dmin * (float)(sc >>    4);
+                for (int l = 0; l < 16; l++)
+                    *y++ = dl * (float)((q[l + 16] >> shift) & 3) - ml;
+
+                shift += 2;
+            }
+            /* q advances by 32 bytes implicitly via n/4 */
+        }
+    }
+}
 
 /* ============================================================
  * IQ3_XXS (type 18) AND IQ3_S (type 21) DEQUANTIZATION
@@ -948,7 +1084,6 @@ static void dequant_q4k(const uint8_t *src, float *dst, size_t n_elements) {
  * The first patch changed this to sequential indexing (qh[e/8] >> (e%8)),
  * which was WRONG — that IS NOT how Q5_K stores qh. REVERT that part.
  *
- * ── BUG 2: qs (low nibble) indexing — THE REMAINING BUG ────────────────────
  *
  * The llama.cpp Q5_K quantizer packs qs with this exact loop:
  *
@@ -1243,27 +1378,25 @@ static void attention_forward(
     float *out,
     const float *x_norm,
     const LayerWeights *lw,
-    float *k_cache,
-    float *v_cache,
+    float *k_cache, float *v_cache,
     int pos,
-    float *qkv_buf,
-    float *scores_buf)
+    float *qkv_buf, float *scores_buf)
 {
-    const int D  = GPT2_EMBED_DIM;
-    const int H  = GPT2_N_HEADS;
-    const int Dh = GPT2_HEAD_DIM;
+    const int D  = CFG_D;
+    const int H  = CFG_H;
+    const int Dh = CFG_Dh;
     const float scale = 1.0f / sqrtf((float)Dh);
 
-    matmul_vec(qkv_buf, lw->qkv_weight, lw->qkv_bias, x_norm, 3 * D, D);
+    matmul_vec(qkv_buf, lw->qkv_weight, lw->qkv_bias, x_norm, 3*D, D);
 
     float *q_vec = qkv_buf;
     float *k_vec = qkv_buf + D;
-    float *v_vec = qkv_buf + 2 * D;
+    float *v_vec = qkv_buf + 2*D;
 
     float *k_dest = k_cache + (size_t)pos * H * Dh;
     float *v_dest = v_cache + (size_t)pos * H * Dh;
-    memcpy(k_dest, k_vec, (size_t)H * Dh * sizeof(float));
-    memcpy(v_dest, v_vec, (size_t)H * Dh * sizeof(float));
+    memcpy(k_dest, k_vec, (size_t)H*Dh*sizeof(float));
+    memcpy(v_dest, v_vec, (size_t)H*Dh*sizeof(float));
 
     int ctx_len = pos + 1;
 
@@ -1271,31 +1404,30 @@ static void attention_forward(
     #pragma omp parallel for schedule(static)
 #endif
     for (int h = 0; h < H; h++) {
-        float *q_h    = q_vec + h * Dh;
-        float *scores = scores_buf + h * GPT2_SEQ_LEN;
+        float *q_h    = q_vec + h*Dh;
+        float *scores = scores_buf + h*CFG_S;
 
         for (int t = 0; t < ctx_len; t++) {
-            float *k_t = k_cache + (size_t)t * H * Dh + h * Dh;
+            float *k_t = k_cache + (size_t)t*H*Dh + h*Dh;
             float dot = 0.0f;
             int d = 0;
-            for (; d <= Dh - 8; d += 8) {
-                dot += q_h[d+0]*k_t[d+0] + q_h[d+1]*k_t[d+1]
-                     + q_h[d+2]*k_t[d+2] + q_h[d+3]*k_t[d+3]
-                     + q_h[d+4]*k_t[d+4] + q_h[d+5]*k_t[d+5]
-                     + q_h[d+6]*k_t[d+6] + q_h[d+7]*k_t[d+7];
-            }
-            for (; d < Dh; d++) dot += q_h[d] * k_t[d];
+            for (; d <= Dh-8; d += 8)
+                dot += q_h[d+0]*k_t[d+0]+q_h[d+1]*k_t[d+1]
+                      +q_h[d+2]*k_t[d+2]+q_h[d+3]*k_t[d+3]
+                      +q_h[d+4]*k_t[d+4]+q_h[d+5]*k_t[d+5]
+                      +q_h[d+6]*k_t[d+6]+q_h[d+7]*k_t[d+7];
+            for (; d < Dh; d++) dot += q_h[d]*k_t[d];
             scores[t] = dot * scale;
         }
 
         softmax(scores, ctx_len);
 
-        float *out_h = out + h * Dh;
-        memset(out_h, 0, Dh * sizeof(float));
+        float *out_h = out + h*Dh;
+        memset(out_h, 0, Dh*sizeof(float));
         for (int t = 0; t < ctx_len; t++) {
-            float *v_t = v_cache + (size_t)t * H * Dh + h * Dh;
+            float *v_t = v_cache + (size_t)t*H*Dh + h*Dh;
             float s = scores[t];
-            for (int d = 0; d < Dh; d++) out_h[d] += s * v_t[d];
+            for (int d = 0; d < Dh; d++) out_h[d] += s*v_t[d];
         }
     }
 }
@@ -1304,38 +1436,27 @@ static void attention_forward(
  * TRANSFORMER BLOCK
  * ============================================================ */
 static void transformer_block_forward(
-    float *x,
-    const LayerWeights *lw,
-    float *k_cache,
-    float *v_cache,
-    int pos,
-    float *scratch_norm,
-    float *scratch_qkv,
-    float *scratch_attn,
-    float *scratch_scores,
-    float *scratch_ffn,
-    float *scratch_proj,   /* [EMBED_DIM] — replaces stack VLA */
-    float *scratch_ffnout  /* [EMBED_DIM] — replaces stack VLA */
-) {
-    const int D = GPT2_EMBED_DIM;
-    const int F = GPT2_FFN_DIM;
+    float *x, const LayerWeights *lw,
+    float *k_cache, float *v_cache, int pos,
+    float *scratch_norm, float *scratch_qkv,
+    float *scratch_attn, float *scratch_scores,
+    float *scratch_ffn,  float *scratch_proj,
+    float *scratch_ffnout)
+{
+    const int D = CFG_D;
+    const int F = CFG_F;
 
-    /* Sub-layer 1: LN + MHA + residual */
     layer_norm(scratch_norm, x, lw->ln1_weight, lw->ln1_bias, D);
     attention_forward(scratch_attn, scratch_norm, lw,
-                      k_cache, v_cache, pos,
-                      scratch_qkv, scratch_scores);
+                      k_cache, v_cache, pos, scratch_qkv, scratch_scores);
     matmul_vec(scratch_proj, lw->attn_proj_weight, lw->attn_proj_bias,
                scratch_attn, D, D);
     for (int i = 0; i < D; i++) x[i] += scratch_proj[i];
 
-    /* Sub-layer 2: LN + FFN + residual */
     layer_norm(scratch_norm, x, lw->ln2_weight, lw->ln2_bias, D);
-    matmul_vec(scratch_ffn, lw->ffn_fc_weight, lw->ffn_fc_bias,
-               scratch_norm, F, D);
+    matmul_vec(scratch_ffn, lw->ffn_fc_weight, lw->ffn_fc_bias, scratch_norm, F, D);
     for (int i = 0; i < F; i++) scratch_ffn[i] = gelu(scratch_ffn[i]);
-    matmul_vec(scratch_ffnout, lw->ffn_proj_weight, lw->ffn_proj_bias,
-               scratch_ffn, D, F);
+    matmul_vec(scratch_ffnout, lw->ffn_proj_weight, lw->ffn_proj_bias, scratch_ffn, D, F);
     for (int i = 0; i < D; i++) x[i] += scratch_ffnout[i];
 }
 
@@ -1343,30 +1464,24 @@ static void transformer_block_forward(
  * MODEL FORWARD
  * ============================================================ */
 static float* model_forward(int token_id, int pos) {
-    const int D = GPT2_EMBED_DIM;
-    const int V = GPT2_VOCAB_SIZE;
+    const int D = CFG_D;
+    const int V = CFG_V;
 
     float *x = g_act.x;
     float *tok_emb = g_weights.wte + (size_t)token_id * D;
     float *pos_emb = g_weights.wpe + (size_t)pos * D;
     for (int i = 0; i < D; i++) x[i] = tok_emb[i] + pos_emb[i];
 
-    for (int l = 0; l < GPT2_N_LAYERS; l++) {
-        size_t layer_offset = (size_t)l * GPT2_SEQ_LEN * GPT2_N_HEADS * GPT2_HEAD_DIM;
+    for (int l = 0; l < CFG_L; l++) {
+        size_t layer_offset = (size_t)l * CFG_S * CFG_H * CFG_Dh;
         float *k_cache_l = g_kv_cache.k_cache + layer_offset;
         float *v_cache_l = g_kv_cache.v_cache + layer_offset;
-
         transformer_block_forward(
             x, &g_weights.layers[l],
             k_cache_l, v_cache_l, pos,
-            g_act.x_norm,
-            g_act.qkv,
-            g_act.attn_out,
-            g_act.attn_scores,
-            g_act.ffn_hidden,
-            g_act.proj_out,     /* FIX #3 */
-            g_act.ffn_out       /* FIX #3 */
-        );
+            g_act.x_norm, g_act.qkv, g_act.attn_out,
+            g_act.attn_scores, g_act.ffn_hidden,
+            g_act.proj_out, g_act.ffn_out);
     }
 
     /* Final LN reuses x_norm (safe: no more LN needed after this) — FIX #4 */
@@ -1385,7 +1500,7 @@ static uint64_t g_rng_state = 0;
 
 static void rng_seed(uint64_t seed) {
     g_rng_state = seed ^ 0xdeadbeefcafeULL;
-    if (g_rng_state == 0) g_rng_state = 1; /* avoid degenerate 0 state */
+    if (g_rng_state == 0) g_rng_state = 1;
 }
 
 static uint64_t rng_u64(void) {
@@ -1400,124 +1515,85 @@ static float rng_float(void) {
 }
 
 typedef struct { float prob; int idx; } ProbIdx;
-
 static int cmp_prob_desc(const void *a, const void *b) {
-    const ProbIdx *pa = (const ProbIdx *)a;
-    const ProbIdx *pb = (const ProbIdx *)b;
+    const ProbIdx *pa = (const ProbIdx *)a, *pb = (const ProbIdx *)b;
     return (pb->prob > pa->prob) ? 1 : (pb->prob < pa->prob) ? -1 : 0;
 }
 
-/* FIX #5: sorted buffer is pre-allocated, not static */
 static int sample_top_p(float *logits, float temperature, float top_p) {
-    const int V = GPT2_VOCAB_SIZE;
+    const int V = CFG_V;
     ProbIdx *sorted = (ProbIdx*)g_act.sorted_buf;
-
     if (temperature < 1e-6f) {
         int best = 0;
-        for (int i = 1; i < V; i++)
-            if (logits[i] > logits[best]) best = i;
+        for (int i = 1; i < V; i++) if (logits[i] > logits[best]) best = i;
         return best;
     }
-
     float inv_temp = 1.0f / temperature;
     for (int i = 0; i < V; i++) logits[i] *= inv_temp;
     softmax(logits, V);
-
     for (int i = 0; i < V; i++) { sorted[i].prob = logits[i]; sorted[i].idx = i; }
     qsort(sorted, V, sizeof(ProbIdx), cmp_prob_desc);
-
-    float cumsum = 0.0f;
-    int nucleus_size = 0;
+    float cumsum = 0.0f; int nucleus_size = 0;
     for (int i = 0; i < V; i++) {
-        cumsum += sorted[i].prob;
-        nucleus_size = i + 1;
+        cumsum += sorted[i].prob; nucleus_size = i+1;
         if (cumsum >= top_p) break;
     }
-
     float nucleus_sum = 0.0f;
     for (int i = 0; i < nucleus_size; i++) nucleus_sum += sorted[i].prob;
     float inv_ns = 1.0f / nucleus_sum;
-
     float r = rng_float(), cdf = 0.0f;
     for (int i = 0; i < nucleus_size; i++) {
         cdf += sorted[i].prob * inv_ns;
         if (r < cdf) return sorted[i].idx;
     }
-    return sorted[nucleus_size - 1].idx;
+    return sorted[nucleus_size-1].idx;
 }
 
 /* ============================================================
- * ACTIVATION / KV CACHE INIT
+ * ACTIVATION / KV CACHE INIT   - sized from g_cfg
  * ============================================================ */
 static void init_activations(void) {
-    const int D = GPT2_EMBED_DIM;
-    const int V = GPT2_VOCAB_SIZE;
-    const int F = GPT2_FFN_DIM;
-    const int H = GPT2_N_HEADS;
-    const int S = GPT2_SEQ_LEN;
-
+    const int D = CFG_D, V = CFG_V, F = CFG_F, H = CFG_H, S = CFG_S;
 #define ACT_ALLOC(field, n) \
-    do { \
-        g_act.field = (float*)malloc((n) * sizeof(float)); \
-        if (!g_act.field) { \
-            fprintf(stderr, "[FATAL] Cannot allocate activation: " #field "\n"); \
-            exit(1); \
-        } \
+    do { g_act.field = (float*)malloc((n)*sizeof(float)); \
+         if (!g_act.field) { fprintf(stderr,"[FATAL] OOM act: " #field "\n"); exit(1); } \
     } while(0)
-
     ACT_ALLOC(x,           D);
     ACT_ALLOC(x_norm,      D);
-    ACT_ALLOC(qkv,      3 * D);
+    ACT_ALLOC(qkv,      3*D);
     ACT_ALLOC(attn_out,    D);
     ACT_ALLOC(proj_out,    D);
     ACT_ALLOC(ffn_hidden,  F);
     ACT_ALLOC(ffn_out,     D);
     ACT_ALLOC(logits,      V);
-    ACT_ALLOC(attn_scores, H * S);
-
-    /* FIX #5: sorted_buf for top-p sampling */
+    ACT_ALLOC(attn_scores, H*S);
     g_act.sorted_buf = malloc((size_t)V * sizeof(ProbIdx));
-    if (!g_act.sorted_buf) {
-        fprintf(stderr, "[FATAL] Cannot allocate sorted_buf\n");
-        exit(1);
-    }
+    if (!g_act.sorted_buf) { fprintf(stderr,"[FATAL] OOM sorted_buf\n"); exit(1); }
 #undef ACT_ALLOC
 }
 
 static void free_activations(void) {
-    free(g_act.x);
-    free(g_act.x_norm);
-    free(g_act.qkv);
-    free(g_act.attn_out);
-    free(g_act.proj_out);
-    free(g_act.ffn_hidden);
-    free(g_act.ffn_out);
-    free(g_act.logits);
-    free(g_act.attn_scores);
+    free(g_act.x); free(g_act.x_norm); free(g_act.qkv);
+    free(g_act.attn_out); free(g_act.proj_out); free(g_act.ffn_hidden);
+    free(g_act.ffn_out); free(g_act.logits); free(g_act.attn_scores);
     free(g_act.sorted_buf);
 }
 
 static void init_kv_cache(void) {
-    const size_t cache_size = (size_t)GPT2_N_LAYERS
-                            * GPT2_SEQ_LEN
-                            * GPT2_N_HEADS
-                            * GPT2_HEAD_DIM;
-
+    const size_t cache_size = (size_t)CFG_L * CFG_S * CFG_H * CFG_Dh;
     g_kv_cache.k_cache = (float*)calloc(cache_size, sizeof(float));
     g_kv_cache.v_cache = (float*)calloc(cache_size, sizeof(float));
     g_kv_cache.seq_len = 0;
-
     if (!g_kv_cache.k_cache || !g_kv_cache.v_cache) {
         fprintf(stderr, "[FATAL] Cannot allocate KV cache (%.1f MB)\n",
                 cache_size * 2 * 4.0 / (1024*1024));
         exit(1);
     }
-    printf("[INFO] KV cache allocated: %.1f MB\n",
-           cache_size * 2 * 4.0 / (1024*1024));
+    printf("[INFO] KV cache allocated: %.1f MB\n", cache_size*2*4.0/(1024*1024));
 }
 
 /* ============================================================
- * ARENA ALLOCATION HELPER
+ * ARENA ALLOCATION + WEIGHT POINTER ASSIGNMENT - uses g_cfg
  * ============================================================ */
 static void arena_init(size_t total_floats) {
     g_arena.capacity = total_floats;
@@ -1531,9 +1607,7 @@ static void arena_init(size_t total_floats) {
 }
 
 static size_t gpt2_total_params(void) {
-    const int D = GPT2_EMBED_DIM, V = GPT2_VOCAB_SIZE;
-    const int S = GPT2_SEQ_LEN,   L = GPT2_N_LAYERS;
-    const int F = GPT2_FFN_DIM;
+    const int D = CFG_D,    V = CFG_V,  S = CFG_S,    L = CFG_L,  F = CFG_F;
     size_t n = 0;
     n += (size_t)V * D + (size_t)S * D;
     for (int l = 0; l < L; l++) {
@@ -1548,35 +1622,43 @@ static size_t gpt2_total_params(void) {
     return n;
 }
 
-/* Assign weight pointers from arena (same order as binary file) */
+/*
+ * Allocates g_weights.layers dynamically (heap, not arena) so that
+ * the struct size doesn't depend on g_cfg.n_layers at compile time.
+ * All weight buffers inside each LayerWeights are still arena-allocated.
+ */
 static void assign_weight_pointers(void) {
-    const int D = GPT2_EMBED_DIM, V = GPT2_VOCAB_SIZE;
-    const int S = GPT2_SEQ_LEN,   L = GPT2_N_LAYERS;
-    const int F = GPT2_FFN_DIM;
+    const int D = CFG_D, V = CFG_V, S = CFG_S, L = CFG_L, F = CFG_F;
 
-    g_weights.wte = arena_alloc((size_t)V * D);
-    g_weights.wpe = arena_alloc((size_t)S * D);
+    g_weights.wte = arena_alloc((size_t)V*D);
+    g_weights.wpe = arena_alloc((size_t)S*D);
+
+    /* Dynamic allocation of layer array — critical for multi-model support */
+    g_weights.layers = (LayerWeights*)calloc((size_t)L, sizeof(LayerWeights));
+    if (!g_weights.layers) {
+        fprintf(stderr, "[FATAL] Cannot allocate LayerWeights array (%d layers)\n", L);
+        exit(1);
+    }
 
     for (int l = 0; l < L; l++) {
         LayerWeights *lw = &g_weights.layers[l];
-        lw->ln1_weight      = arena_alloc(D);
-        lw->ln1_bias        = arena_alloc(D);
-        lw->qkv_weight      = arena_alloc((size_t)3*D*D);
-        lw->qkv_bias        = arena_alloc(3*D);
+        lw->ln1_weight       = arena_alloc(D);
+        lw->ln1_bias         = arena_alloc(D);
+        lw->qkv_weight       = arena_alloc((size_t)3*D*D);
+        lw->qkv_bias         = arena_alloc(3*D);
         lw->attn_proj_weight = arena_alloc((size_t)D*D);
-        lw->attn_proj_bias  = arena_alloc(D);
-        lw->ln2_weight      = arena_alloc(D);
-        lw->ln2_bias        = arena_alloc(D);
-        lw->ffn_fc_weight   = arena_alloc((size_t)F*D);
-        lw->ffn_fc_bias     = arena_alloc(F);
-        lw->ffn_proj_weight = arena_alloc((size_t)D*F);
-        lw->ffn_proj_bias   = arena_alloc(D);
+        lw->attn_proj_bias   = arena_alloc(D);
+        lw->ln2_weight       = arena_alloc(D);
+        lw->ln2_bias         = arena_alloc(D);
+        lw->ffn_fc_weight    = arena_alloc((size_t)F*D);
+        lw->ffn_fc_bias      = arena_alloc(F);
+        lw->ffn_proj_weight  = arena_alloc((size_t)D*F);
+        lw->ffn_proj_bias    = arena_alloc(D);
     }
 
     g_weights.ln_f_weight = arena_alloc(D);
     g_weights.ln_f_bias   = arena_alloc(D);
 }
-
 /* ============================================================
  * BACKEND 1: CUSTOM FLOAT32 BINARY FORMAT (.bin)
  *
@@ -1584,7 +1666,9 @@ static void assign_weight_pointers(void) {
  *   Header: [magic:u32][version:u32][vocab_size:u32][seq_len:u32]
  *           [n_layers:u32][n_heads:u32][embed_dim:u32]
  *   Weights: float32 arrays in order matching assign_weight_pointers().
+ * Architecture parameters are read into g_cfg from this header.
  * ============================================================ */
+
 static void load_model_bin(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -1594,57 +1678,51 @@ static void load_model_bin(const char *path) {
     }
 
     uint32_t magic, version, vocab_size, seq_len, n_layers, n_heads, embed_dim;
-
 #define FREAD1(var) \
-    do { if (fread(&(var), sizeof(var), 1, f) != 1) { \
-        fprintf(stderr, "[ERROR] Truncated header in %s\n", path); \
+    do { if (fread(&(var),sizeof(var),1,f)!=1) { \
+        fprintf(stderr,"[ERROR] Truncated header in %s\n",path); \
         fclose(f); exit(1); } } while(0)
-
     FREAD1(magic); FREAD1(version); FREAD1(vocab_size); FREAD1(seq_len);
     FREAD1(n_layers); FREAD1(n_heads); FREAD1(embed_dim);
 #undef FREAD1
 
     if (magic != MODEL_MAGIC) {
-        fprintf(stderr, "[ERROR] Bad magic 0x%08X (expected 0x%08X)\n",
-                magic, MODEL_MAGIC);
+        fprintf(stderr, "[ERROR] Bad magic 0x%08X (expected 0x%08X)\n", magic, MODEL_MAGIC);
         fclose(f); exit(1);
     }
     if (version != MODEL_VERSION) {
-        fprintf(stderr, "[ERROR] Version mismatch: got %u, expected %u\n",
-                version, MODEL_VERSION);
-        fclose(f); exit(1);
-    }
-    if (vocab_size != GPT2_VOCAB_SIZE || seq_len != GPT2_SEQ_LEN ||
-        n_layers   != GPT2_N_LAYERS   || n_heads != GPT2_N_HEADS ||
-        embed_dim  != GPT2_EMBED_DIM) {
-        fprintf(stderr, "[ERROR] Architecture mismatch:\n");
-        fprintf(stderr, "  Expected: V=%d S=%d L=%d H=%d D=%d\n",
-                GPT2_VOCAB_SIZE, GPT2_SEQ_LEN, GPT2_N_LAYERS,
-                GPT2_N_HEADS,    GPT2_EMBED_DIM);
-        fprintf(stderr, "  Got:      V=%u S=%u L=%u H=%u D=%u\n",
-                vocab_size, seq_len, n_layers, n_heads, embed_dim);
+        fprintf(stderr, "[ERROR] Version mismatch: got %u, expected %u\n", version, MODEL_VERSION);
         fclose(f); exit(1);
     }
 
+    /* Populate runtime config from file header */
+    g_cfg.vocab_size = (int)vocab_size;
+    g_cfg.seq_len    = (int)seq_len;
+    g_cfg.n_layers   = (int)n_layers;
+    g_cfg.n_heads    = (int)n_heads;
+    g_cfg.embed_dim  = (int)embed_dim;
+    g_cfg.ffn_dim    = 4 * (int)embed_dim;      /* GPT-2 always 4x */
+    g_cfg.head_dim   = (int)embed_dim / (int)n_heads;
+
+    printf("[INFO] Architecture: L=%d H=%d D=%d F=%d Dh=%d V=%d S=%d\n",
+           CFG_L, CFG_H, CFG_D, CFG_F, CFG_Dh, CFG_V, CFG_S);
+
     size_t total = gpt2_total_params();
-    printf("[INFO] Parameters: %zu  (%.1f MB)\n",
-           total, total * 4.0 / (1024*1024));
+    printf("[INFO] Parameters: %zu  (%.1f MB)\n", total, total*4.0/(1024*1024));
 
     arena_init(total);
     assign_weight_pointers();
 
-    /* Read all floats directly into the arena */
     if (fread(g_arena.data, sizeof(float), total, f) != total) {
         fprintf(stderr, "[ERROR] Truncated weight data in %s\n", path);
         fclose(f); exit(1);
     }
 
-    /* GPT-2 uses tied weights: LM head == token embedding table */
-    g_weights.lm_head = g_weights.wte;
-
+    g_weights.lm_head = g_weights.wte;  /* GPT-2: tied weights */
     fclose(f);
     printf("[INFO] Loaded (float32 .bin): %s\n", path);
 }
+
 
 /* ============================================================
  * BACKEND 2: GGUF FORMAT (.gguf) WITH F16 WEIGHTS
@@ -1654,6 +1732,13 @@ static void load_model_bin(const char *path) {
  *   - GGUF version 1, 2, 3
  *   - Tensor types F32 and F16
  *   - Key-value metadata (skipped, but length must be parsed)
+ *
+ * Architecture is read from GGUF metadata key-value pairs:
+ *   gpt2.block_count          → n_layers
+ *   gpt2.attention.head_count → n_heads
+ *   gpt2.embedding_length     → embed_dim
+ *   gpt2.feed_forward_length  → ffn_dim
+ *   gpt2.context_length       → seq_len
  *
  * Tensor name mapping (GGUF GPT-2 names → our weight pointers):
  *   token_embd.weight          → wte
@@ -1689,21 +1774,20 @@ static void gguf_read_bytes(FILE *f, void *buf, size_t n) {
         exit(1);
     }
 }
-
-static uint8_t  gguf_u8(FILE *f)  { uint8_t  v; gguf_read_bytes(f, &v, 1); return v; }
-static uint16_t gguf_u16(FILE *f) { uint16_t v; gguf_read_bytes(f, &v, 2); return v; }
-static uint32_t gguf_u32(FILE *f) { uint32_t v; gguf_read_bytes(f, &v, 4); return v; }
-static uint64_t gguf_u64(FILE *f) { uint64_t v; gguf_read_bytes(f, &v, 8); return v; }
-static int32_t  gguf_i32(FILE *f) { int32_t  v; gguf_read_bytes(f, &v, 4); return v; }
-static int64_t  gguf_i64(FILE *f) { int64_t  v; gguf_read_bytes(f, &v, 8); return v; }
-static float    gguf_f32(FILE *f) { float    v; gguf_read_bytes(f, &v, 4); return v; }
-static double   gguf_f64(FILE *f) { double   v; gguf_read_bytes(f, &v, 8); return v; }
+static uint8_t  gguf_u8(FILE *f)  { uint8_t  v; gguf_read_bytes(f,&v,1); return v; }
+static uint16_t gguf_u16(FILE *f) { uint16_t v; gguf_read_bytes(f,&v,2); return v; }
+static uint32_t gguf_u32(FILE *f) { uint32_t v; gguf_read_bytes(f,&v,4); return v; }
+static uint64_t gguf_u64(FILE *f) { uint64_t v; gguf_read_bytes(f,&v,8); return v; }
+static int32_t  gguf_i32(FILE *f) { int32_t  v; gguf_read_bytes(f,&v,4); return v; }
+static int64_t  gguf_i64(FILE *f) { int64_t  v; gguf_read_bytes(f,&v,8); return v; }
+static float    gguf_f32(FILE *f) { float    v; gguf_read_bytes(f,&v,4); return v; }
+static double   gguf_f64(FILE *f) { double   v; gguf_read_bytes(f,&v,8); return v; }
 
 /* Read a GGUF string (uint64 length + bytes, NOT null-terminated in file) */
 static char* gguf_read_string(FILE *f, uint64_t *out_len) {
     uint64_t len = gguf_u64(f);
     char *s = (char*)malloc(len + 1);
-    if (!s) { fprintf(stderr, "[FATAL] OOM in gguf_read_string\n"); exit(1); }
+    if (!s) { fprintf(stderr,"[FATAL] OOM gguf_read_string\n"); exit(1); }
     gguf_read_bytes(f, s, len);
     s[len] = '\0';
     if (out_len) *out_len = len;
@@ -1716,9 +1800,7 @@ static void gguf_skip_value(FILE *f, uint32_t vtype);
 static void gguf_skip_array(FILE *f) {
     uint32_t elem_type = gguf_u32(f);
     uint64_t count     = gguf_u64(f);
-    for (uint64_t i = 0; i < count; i++) {
-        gguf_skip_value(f, elem_type);
-    }
+    for (uint64_t i = 0; i < count; i++) gguf_skip_value(f, elem_type);
 }
 
 static void gguf_skip_value(FILE *f, uint32_t vtype) {
@@ -1731,11 +1813,7 @@ static void gguf_skip_value(FILE *f, uint32_t vtype) {
         case GGUF_MTYPE_INT32:   gguf_i32(f); break;
         case GGUF_MTYPE_FLOAT32: gguf_f32(f); break;
         case GGUF_MTYPE_BOOL:    gguf_u8(f);  break;
-        case GGUF_MTYPE_STRING: {
-            char *s = gguf_read_string(f, NULL);
-            free(s);
-            break;
-        }
+        case GGUF_MTYPE_STRING:  { char *s = gguf_read_string(f,NULL); free(s); break; }
         case GGUF_MTYPE_ARRAY:   gguf_skip_array(f); break;
         case GGUF_MTYPE_UINT64:  gguf_u64(f); break;
         case GGUF_MTYPE_INT64:   gguf_i64(f); break;
@@ -1751,47 +1829,44 @@ static void gguf_skip_value(FILE *f, uint32_t vtype) {
 #define GGUF_MAX_DIMS      4
 typedef struct {
     char     name[256];
-    uint32_t type;          /* GGUF_TYPE_F32 or GGUF_TYPE_F16 */
+    uint32_t type;
     uint32_t n_dims;
     uint64_t dims[GGUF_MAX_DIMS];
-    uint64_t offset;        /* byte offset from data section start */
+    uint64_t offset;
     size_t   n_elements;
 } GGUFTensor;
 
 /* Map a GGUF tensor name to the corresponding float* in our weight struct.
  * Returns NULL if the tensor is not needed. */
+
 static float** gguf_name_to_ptr(const char *name) {
-    /* global tensors */
-    if (strcmp(name, "token_embd.weight") == 0) return &g_weights.wte;
-    if (strcmp(name, "position_embd.weight") == 0) return &g_weights.wpe;
+    if (strcmp(name, "token_embd.weight")  == 0) return &g_weights.wte;
+    if (strcmp(name, "position_embd.weight")== 0) return &g_weights.wpe;
     if (strcmp(name, "output_norm.weight") == 0) return &g_weights.ln_f_weight;
     if (strcmp(name, "output_norm.bias")   == 0) return &g_weights.ln_f_bias;
     if (strcmp(name, "output.weight")      == 0) return &g_weights.lm_head;
-
-    /* per-layer tensors: blk.N.xxx */
     if (strncmp(name, "blk.", 4) == 0) {
         int layer = atoi(name + 4);
-        if (layer < 0 || layer >= GPT2_N_LAYERS) return NULL;
+        if (layer < 0 || layer >= CFG_L) return NULL;   /* uses runtime cfg */
         const char *rest = strchr(name + 4, '.');
         if (!rest) return NULL;
-        rest++;  /* skip the '.' */
+        rest++;
         LayerWeights *lw = &g_weights.layers[layer];
-        if (strcmp(rest, "attn_norm.weight")   == 0) return &lw->ln1_weight;
-        if (strcmp(rest, "attn_norm.bias")     == 0) return &lw->ln1_bias;
-        if (strcmp(rest, "attn_qkv.weight")    == 0) return &lw->qkv_weight;
-        if (strcmp(rest, "attn_qkv.bias")      == 0) return &lw->qkv_bias;
-        if (strcmp(rest, "attn_output.weight") == 0) return &lw->attn_proj_weight;
-        if (strcmp(rest, "attn_output.bias")   == 0) return &lw->attn_proj_bias;
-        if (strcmp(rest, "ffn_norm.weight")    == 0) return &lw->ln2_weight;
-        if (strcmp(rest, "ffn_norm.bias")      == 0) return &lw->ln2_bias;
-        if (strcmp(rest, "ffn_up.weight")      == 0) return &lw->ffn_fc_weight;
-        if (strcmp(rest, "ffn_up.bias")        == 0) return &lw->ffn_fc_bias;
-        if (strcmp(rest, "ffn_down.weight")    == 0) return &lw->ffn_proj_weight;
-        if (strcmp(rest, "ffn_down.bias")      == 0) return &lw->ffn_proj_bias;
+        if (strcmp(rest,"attn_norm.weight")   ==0) return &lw->ln1_weight;
+        if (strcmp(rest,"attn_norm.bias")     ==0) return &lw->ln1_bias;
+        if (strcmp(rest,"attn_qkv.weight")    ==0) return &lw->qkv_weight;
+        if (strcmp(rest,"attn_qkv.bias")      ==0) return &lw->qkv_bias;
+        if (strcmp(rest,"attn_output.weight") ==0) return &lw->attn_proj_weight;
+        if (strcmp(rest,"attn_output.bias")   ==0) return &lw->attn_proj_bias;
+        if (strcmp(rest,"ffn_norm.weight")    ==0) return &lw->ln2_weight;
+        if (strcmp(rest,"ffn_norm.bias")      ==0) return &lw->ln2_bias;
+        if (strcmp(rest,"ffn_up.weight")      ==0) return &lw->ffn_fc_weight;
+        if (strcmp(rest,"ffn_up.bias")        ==0) return &lw->ffn_fc_bias;
+        if (strcmp(rest,"ffn_down.weight")    ==0) return &lw->ffn_proj_weight;
+        if (strcmp(rest,"ffn_down.bias")      ==0) return &lw->ffn_proj_bias;
     }
     return NULL;
 }
-
 
 
 /*
@@ -1815,56 +1890,88 @@ static float** gguf_name_to_ptr(const char *name) {
 
 static void load_model_gguf(const char *path) {
     FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "[ERROR] Cannot open GGUF file: %s\n", path);
-        exit(1);
-    }
+    if (!f) { fprintf(stderr,"[ERROR] Cannot open GGUF file: %s\n", path); exit(1); }
 
-    /* ---- Header ---- */
     uint32_t magic   = gguf_u32(f);
     uint32_t version = gguf_u32(f);
-
     if (magic != GGUF_MAGIC) {
-        fprintf(stderr, "[ERROR] Not a GGUF file (magic=0x%08X)\n", magic);
+        fprintf(stderr,"[ERROR] Not a GGUF file (magic=0x%08X)\n", magic);
         fclose(f); exit(1);
     }
     if (version < GGUF_VERSION_MIN || version > GGUF_VERSION_MAX) {
-        fprintf(stderr, "[ERROR] Unsupported GGUF version %u (supported: %u-%u)\n",
-                version, GGUF_VERSION_MIN, GGUF_VERSION_MAX);
+        fprintf(stderr,"[ERROR] Unsupported GGUF version %u\n", version);
         fclose(f); exit(1);
     }
     printf("[INFO] GGUF version %u\n", version);
 
     uint64_t n_tensors = gguf_u64(f);
     uint64_t n_kv      = gguf_u64(f);
+    printf("[INFO] Tensors: %llu  Metadata KV pairs: %llu\n",(unsigned long long)n_tensors, (unsigned long long)n_kv);
 
-    printf("[INFO] Tensors: %llu  Metadata KV pairs: %llu\n",
-           (unsigned long long)n_tensors, (unsigned long long)n_kv);
+    /* ---- Read metadata, capture architecture keys ---- */
+    /* Set defaults for all GPT-2 variants first */
+    g_cfg.vocab_size = MAX_VOCAB_SIZE;
+    g_cfg.seq_len    = MAX_SEQ_LEN;
+    g_cfg.n_layers   = 0;  /* must be populated from metadata */
+    g_cfg.n_heads    = 0;
+    g_cfg.embed_dim  = 0;
+    g_cfg.ffn_dim    = 0;
 
-    /* ---- Skip metadata key-value pairs ---- */
     for (uint64_t i = 0; i < n_kv; i++) {
-        char *key = gguf_read_string(f, NULL);
+        char *key    = gguf_read_string(f, NULL);
         uint32_t vtype = gguf_u32(f);
-        gguf_skip_value(f, vtype);
+
+        /* Capture uint32 architecture keys before skipping */
+        if (vtype == GGUF_MTYPE_UINT32) {
+            uint32_t val = gguf_u32(f);
+            if      (strcmp(key, "gpt2.block_count")          == 0) g_cfg.n_layers  = (int)val;
+            else if (strcmp(key, "gpt2.attention.head_count") == 0) g_cfg.n_heads    = (int)val;
+            else if (strcmp(key, "gpt2.embedding_length")     == 0) g_cfg.embed_dim  = (int)val;
+            else if (strcmp(key, "gpt2.feed_forward_length")  == 0) g_cfg.ffn_dim    = (int)val;
+            else if (strcmp(key, "gpt2.context_length")       == 0) g_cfg.seq_len    = (int)val;
+            /* fallthrough — value already consumed */
+        } else {
+            gguf_skip_value(f, vtype);
+        }
         free(key);
     }
 
-    /* ---- Read tensor info ---- */
-    if (n_tensors > GGUF_MAX_TENSORS) {
-        fprintf(stderr, "[ERROR] Too many tensors (%llu > %d)\n", (unsigned long long)n_tensors, GGUF_MAX_TENSORS);
+    /* Validate required architecture fields */
+    
+    if (g_cfg.n_layers == 0 || g_cfg.n_heads == 0 || g_cfg.embed_dim == 0) {
+        fprintf(stderr, "[ERROR] GGUF missing required architecture metadata.\n");
+        fprintf(stderr, "  Got: L=%d H=%d D=%d\n", CFG_L, CFG_H, CFG_D);
+        fprintf(stderr, "  Expected keys: gpt2.block_count, gpt2.attention.head_count, gpt2.embedding_length\n");
         fclose(f); exit(1);
     }
+    if (g_cfg.ffn_dim == 0) g_cfg.ffn_dim = 4 * g_cfg.embed_dim;   /* safe default */
+    g_cfg.head_dim = g_cfg.embed_dim / g_cfg.n_heads;
 
+    printf("[INFO] Architecture: L=%d H=%d D=%d F=%d Dh=%d V=%d S=%d\n",
+           CFG_L, CFG_H, CFG_D, CFG_F, CFG_Dh, CFG_V, CFG_S);
+
+    /* Infer model variant */
+    if      (CFG_L == 12 && CFG_D ==  768) printf("[INFO] Model variant: GPT-2 Small  (124M)\n");
+    else if (CFG_L == 24 && CFG_D == 1024) printf("[INFO] Model variant: GPT-2 Medium (345M)\n");
+    else if (CFG_L == 36 && CFG_D == 1280) printf("[INFO] Model variant: GPT-2 Large  (774M)\n");
+    else if (CFG_L == 48 && CFG_D == 1600) printf("[INFO] Model variant: GPT-2 XL    (1.5B)\n");
+    else                                   printf("[INFO] Model variant: Custom (%dL/%dD)\n", CFG_L, CFG_D);
+
+    /* ---- Read tensor info descriptors ---- */
+    if (n_tensors > GGUF_MAX_TENSORS) {
+        fprintf(stderr,"[ERROR] Too many tensors (%llu > %d)\n",
+                (unsigned long long)n_tensors, GGUF_MAX_TENSORS);
+        fclose(f); exit(1);
+    }
     GGUFTensor *tensors = (GGUFTensor*)calloc(n_tensors, sizeof(GGUFTensor));
-    if (!tensors) { fprintf(stderr, "[FATAL] OOM\n"); exit(1); }
+    if (!tensors) { fprintf(stderr,"[FATAL] OOM\n"); exit(1); }
 
     for (uint64_t i = 0; i < n_tensors; i++) {
         GGUFTensor *t = &tensors[i];
         uint64_t name_len;
         char *name = gguf_read_string(f, &name_len);
-        strncpy(t->name, name, sizeof(t->name) - 1);
+        strncpy(t->name, name, sizeof(t->name)-1);
         free(name);
-
         t->n_dims = gguf_u32(f);
         t->n_elements = 1;
         for (uint32_t d = 0; d < t->n_dims; d++) {
@@ -1883,259 +1990,114 @@ static void load_model_gguf(const char *path) {
 
     /* ---- Allocate arena and assign weight pointers ---- */
     size_t total = gpt2_total_params();
-    printf("[INFO] Parameters: %zu  (%.1f MB float32)\n", total, total * 4.0 / (1024*1024));
+    printf("[INFO] Parameters: %zu  (%.1f MB float32)\n", total, total*4.0/(1024*1024));
 
     /* Extra V*D floats reserved for lm_head (output.weight tensor in GGUF).
      * GPT-2 uses tied weights, but llama.cpp GGUF stores output.weight as a
      * separate tensor. We allocate space for it and default it to a copy of
      * wte; if output.weight is present it will overwrite this copy. */
-    const size_t lm_head_size = (size_t)GPT2_VOCAB_SIZE * GPT2_EMBED_DIM;
+    const size_t lm_head_size = (size_t)CFG_V * CFG_D;
     arena_init(total + lm_head_size);
-    assign_weight_pointers();
+    assign_weight_pointers();   
     /* Allocate and default-populate lm_head from arena */
     g_weights.lm_head = arena_alloc(lm_head_size);
-    memcpy(g_weights.lm_head, g_weights.wte, lm_head_size * sizeof(float));
-
+    memcpy(g_weights.lm_head, g_weights.wte, lm_head_size * sizeof(float));   
+    
     /* ---- Load each tensor ---- */
     int tensors_loaded = 0;
+
+/* Reusable macro for block-quantized tensor load */
+#define LOAD_QUANT_TENSOR(TYPE_ID, BLOCK_SIZE, BYTES_PER_BLOCK, DEQUANT_FN) \
+    if (t->n_elements % (BLOCK_SIZE) != 0) { \
+        fprintf(stderr,"[ERROR] Tensor %s: n_elements=%zu not multiple of %d\n", \
+                t->name,(size_t)t->n_elements,(BLOCK_SIZE)); \
+        fclose(f); free(tensors); exit(1); \
+    } \
+    do { \
+        size_t raw_bytes = (t->n_elements / (BLOCK_SIZE)) * (BYTES_PER_BLOCK); \
+        uint8_t *tmp = (uint8_t*)malloc(raw_bytes); \
+        if (!tmp) { fprintf(stderr,"[FATAL] OOM buf %s\n",t->name); exit(1); } \
+        if (fread(tmp,1,raw_bytes,f) != raw_bytes) { \
+            fprintf(stderr,"[ERROR] Short read tensor %s\n",t->name); \
+            free(tmp); fclose(f); free(tensors); exit(1); \
+        } \
+        (DEQUANT_FN)(tmp, dst, t->n_elements); \
+        free(tmp); \
+    } while(0)
+
     for (uint64_t i = 0; i < n_tensors; i++) {
         GGUFTensor *t = &tensors[i];
-
         float **dst_ptr = gguf_name_to_ptr(t->name);
         if (!dst_ptr) {
-            /* Skip tensors we don't need */
-            const char *tname = "UNK";
-            if      (t->type == GGUF_TYPE_F32)     tname = "F32 ";
-            else if (t->type == GGUF_TYPE_F16)     tname = "F16 ";
-            else if (t->type == GGUF_TYPE_IQ4_XS)  tname = "IQ4_XS";
-            else if (t->type == GGUF_TYPE_IQ3_XXS) tname = "IQ3_XXS";
-            else if (t->type == GGUF_TYPE_IQ3_S)   tname = "IQ3_S";
-            else if (t->type == GGUF_TYPE_Q3_K)    tname = "Q3_K";
-            else if (t->type == GGUF_TYPE_Q4_K)    tname = "Q4_K";
-            else if (t->type == GGUF_TYPE_Q5_K)    tname = "Q5_K";
-            else if (t->type == GGUF_TYPE_Q6_K)    tname = "Q6_K"; 
-            else if (t->type == GGUF_TYPE_Q8_0)    tname = "Q8_0";
-            
-            fprintf(stderr, "[SKIP] %-50s  %s  n=%7zu  (unmapped name)\n", t->name, tname, t->n_elements);
+            fprintf(stderr, "[SKIP] %-50s  n=%7zu\n", t->name, t->n_elements);
             continue;
-            
         }
         float *dst = *dst_ptr;
 
         long tensor_offset = data_start + (long)t->offset;
         fseek(f, tensor_offset, SEEK_SET);
 
-        if (t->type == GGUF_TYPE_F32) {
+        switch (t->type) {
+        case GGUF_TYPE_F32:
             if (fread(dst, sizeof(float), t->n_elements, f) != t->n_elements) {
-                fprintf(stderr, "[ERROR] Short read on tensor %s\n", t->name);
+                fprintf(stderr,"[ERROR] Short read F32 %s\n", t->name);
                 fclose(f); free(tensors); exit(1);
             }
-
-        } else if (t->type == GGUF_TYPE_F16) {
-            /* Dequantize F16 → F32 */
+            break;
+        case GGUF_TYPE_F16: {
             uint16_t *tmp = (uint16_t*)malloc(t->n_elements * sizeof(uint16_t));
-            if (!tmp) { fprintf(stderr, "[FATAL] OOM F16 buf\n"); exit(1); }
+            if (!tmp) { fprintf(stderr,"[FATAL] OOM F16\n"); exit(1); }
             if (fread(tmp, sizeof(uint16_t), t->n_elements, f) != t->n_elements) {
-                fprintf(stderr, "[ERROR] Short read F16 tensor %s\n", t->name);
+                fprintf(stderr,"[ERROR] Short read F16 %s\n", t->name);
                 free(tmp); fclose(f); free(tensors); exit(1);
             }
-            for (size_t e = 0; e < t->n_elements; e++) {
-                dst[e] = f16_to_f32(tmp[e]);
-            }
+            for (size_t e = 0; e < t->n_elements; e++) dst[e] = f16_to_f32(tmp[e]);
             free(tmp);
-
-        } else if (t->type == GGUF_TYPE_IQ3_XXS) {
-            /* Dequantize IQ3_XXS (type 18) → F32.
-             * Also handles individual tensors in IQ3_XS mixed-precision files. */
-            if (t->n_elements % IQ3_XXS_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] IQ3_XXS tensor %s has %zu elements "
-                                "(not a multiple of %d)\n",
-                        t->name, t->n_elements, IQ3_XXS_BLOCK_SIZE);
-                fclose(f); free(tensors); exit(1);
-            }
-            size_t raw_bytes = (t->n_elements / IQ3_XXS_BLOCK_SIZE) * IQ3_XXS_BYTES_PER_BLOCK;
-            uint8_t *tmp = (uint8_t *)malloc(raw_bytes);
-            if (!tmp) {
-                fprintf(stderr, "[FATAL] OOM for IQ3_XXS buffer (%s)\n", t->name);
-                exit(1);
-            }
-            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read on IQ3_XXS tensor %s\n", t->name);
-                free(tmp); fclose(f); free(tensors); exit(1);
-            }
-            dequant_iq3xxs(tmp, dst, t->n_elements);
-            free(tmp);
-
-        } else if (t->type == GGUF_TYPE_IQ3_S) {
-            /* Dequantize IQ3_S (type 21) → F32.
-             * Also handles tensors in IQ3_S, IQ3_M, and IQ3_XS mixed-precision files. */
-            if (t->n_elements % IQ3_S_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] IQ3_S tensor %s has %zu elements "
-                                "(not a multiple of %d)\n",
-                        t->name, t->n_elements, IQ3_S_BLOCK_SIZE);
-                fclose(f); free(tensors); exit(1);
-            }
-            size_t raw_bytes = (t->n_elements / IQ3_S_BLOCK_SIZE) * IQ3_S_BYTES_PER_BLOCK;
-            uint8_t *tmp = (uint8_t *)malloc(raw_bytes);
-            if (!tmp) {
-                fprintf(stderr, "[FATAL] OOM for IQ3_S buffer (%s)\n", t->name);
-                exit(1);
-            }
-            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read on IQ3_S tensor %s\n", t->name);
-                free(tmp); fclose(f); free(tensors); exit(1);
-            }
-            dequant_iq3s(tmp, dst, t->n_elements);
-            free(tmp);
-
-        } else if (t->type == GGUF_TYPE_IQ4_XS) {
-            /* Dequantize IQ4_XS → F32 */
-            if (t->n_elements % IQ4_XS_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] IQ4_XS tensor %s has %zu elements "
-                                "(not a multiple of %d)\n",
-                        t->name, t->n_elements, IQ4_XS_BLOCK_SIZE);
-                fclose(f); free(tensors); exit(1);
-            }
-            size_t raw_bytes = (t->n_elements / IQ4_XS_BLOCK_SIZE) * IQ4_XS_BYTES_PER_BLOCK;
-            uint8_t *tmp = (uint8_t *)malloc(raw_bytes);
-            if (!tmp) {
-                fprintf(stderr, "[FATAL] OOM for IQ4_XS buffer (%s)\n", t->name);
-                exit(1);
-            }
-            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read on IQ4_XS tensor %s\n", t->name);
-                free(tmp); fclose(f); free(tensors); exit(1);
-            }
-            dequant_iq4_xs(tmp, dst, t->n_elements);
-            free(tmp);
-
-        } else if (t->type == GGUF_TYPE_Q3_K) {
-            /* Dequantize Q3_K (S, M, or L variant) → F32.
-             * All three variants share type ID 11 and identical binary format.
-             * The S/M/L suffix only affects the encoding heuristics. */
-            if (t->n_elements % Q3_K_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] Q3_K tensor %s: n_elements=%zu not multiple of %d\n",
-                        t->name, t->n_elements, Q3_K_BLOCK_SIZE);
-                fclose(f); free(tensors); exit(1);
-            }
-            size_t raw_bytes = (t->n_elements / Q3_K_BLOCK_SIZE) * Q3_K_BYTES_PER_BLOCK;
-            uint8_t *tmp = (uint8_t*)malloc(raw_bytes);
-            if (!tmp) { fprintf(stderr, "[FATAL] OOM Q3_K buf (%s)\n", t->name); exit(1); }
-            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read Q3_K tensor %s\n", t->name);
-                free(tmp); fclose(f); free(tensors); exit(1);
-            }
-            dequant_q3k(tmp, dst, t->n_elements);
-            free(tmp);
-
-        } else if (t->type == GGUF_TYPE_Q4_K) {
-            /* Dequantize Q4_K (S or M variant) → F32. Both share type 12. */
-            if (t->n_elements % Q4_K_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] Q4_K tensor %s has %zu elements "
-                                "(not a multiple of %d)\n",
-                        t->name, t->n_elements, Q4_K_BLOCK_SIZE);
-                fclose(f); free(tensors); exit(1);
-            }
-            size_t raw_bytes = (t->n_elements / Q4_K_BLOCK_SIZE) * Q4_K_BYTES_PER_BLOCK;
-            uint8_t *tmp = (uint8_t *)malloc(raw_bytes);
-            if (!tmp) {
-                fprintf(stderr, "[FATAL] OOM for Q4_K buffer (%s)\n", t->name);
-                exit(1);
-            }
-            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read on Q4_K tensor %s\n", t->name);
-                free(tmp); fclose(f); free(tensors); exit(1);
-            }
-            dequant_q4k(tmp, dst, t->n_elements);
-            free(tmp);
-        } else if (t->type == GGUF_TYPE_Q5_K) {
-            /* Dequantize Q5_K (S or M variant) → F32. Both variants share type 13. */
-            if (t->n_elements % Q5_K_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] Q5_K tensor %s: n_elements=%zu not multiple of %d\n",
-                        t->name, t->n_elements, Q5_K_BLOCK_SIZE);
-                fclose(f); free(tensors); exit(1);
-            }
-            size_t raw_bytes = (t->n_elements / Q5_K_BLOCK_SIZE) * Q5_K_BYTES_PER_BLOCK;
-            uint8_t *tmp = (uint8_t*)malloc(raw_bytes);
-            if (!tmp) { fprintf(stderr, "[FATAL] OOM Q5_K buf (%s)\n", t->name); exit(1); }
-            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read Q5_K tensor %s\n", t->name);
-                free(tmp); fclose(f); free(tensors); exit(1);
-            }
-            dequant_q5k(tmp, dst, t->n_elements);
-            free(tmp);
-
-        } else if (t->type == GGUF_TYPE_Q6_K) {
-            /* Dequantize Q6_K → F32 */
-            if (t->n_elements % Q6_K_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] Q6_K tensor %s: n_elements=%zu not multiple of %d\n",
-                        t->name, t->n_elements, Q6_K_BLOCK_SIZE);
-                fclose(f); free(tensors); exit(1);
-            }
-            size_t raw_bytes = (t->n_elements / Q6_K_BLOCK_SIZE) * Q6_K_BYTES_PER_BLOCK;
-            uint8_t *tmp = (uint8_t*)malloc(raw_bytes);
-            if (!tmp) { fprintf(stderr, "[FATAL] OOM Q6_K buf (%s)\n", t->name); exit(1); }
-            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read Q6_K tensor %s\n", t->name);
-                free(tmp); fclose(f); free(tensors); exit(1);
-            }
-            dequant_q6k(tmp, dst, t->n_elements);
-            free(tmp);
-
-        } else if (t->type == GGUF_TYPE_Q8_0) {
-            /* Dequantize Q8_0 → F32 */
-            if (t->n_elements % Q8_0_BLOCK_SIZE != 0) {
-                fprintf(stderr, "[ERROR] Q8_0 tensor %s: n_elements=%zu not multiple of %d\n",
-                        t->name, t->n_elements, Q8_0_BLOCK_SIZE);
-                fclose(f); free(tensors); exit(1);
-            }
-            size_t raw_bytes = (t->n_elements / Q8_0_BLOCK_SIZE) * Q8_0_BYTES_PER_BLOCK;
-            uint8_t *tmp = (uint8_t*)malloc(raw_bytes);
-            if (!tmp) { fprintf(stderr, "[FATAL] OOM Q8_0 buf (%s)\n", t->name); exit(1); }
-            if (fread(tmp, 1, raw_bytes, f) != raw_bytes) {
-                fprintf(stderr, "[ERROR] Short read Q8_0 tensor %s\n", t->name);
-                free(tmp); fclose(f); free(tensors); exit(1);
-            }
-            dequant_q8_0(tmp, dst, t->n_elements);
-            free(tmp);
-
-        } else {
-            fprintf(stderr, "[ERROR] Unsupported tensor type %u for %s\n",t->type, t->name);
-            fprintf(stderr, "  Supported: F32 (0), F16 (1),IQ4_XS (23), Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14), Q8_0 (8),\n");
-            fprintf(stderr, "  To convert: ./quantize model.gguf out.gguf Q5_K_M\n");
+            break;
+        }
+        case GGUF_TYPE_Q2_K:
+            LOAD_QUANT_TENSOR(GGUF_TYPE_Q2_K,   Q2_K_BLOCK_SIZE,   Q2_K_BYTES_PER_BLOCK,   dequant_q2k);
+            break;
+        case GGUF_TYPE_IQ3_XXS:
+            LOAD_QUANT_TENSOR(GGUF_TYPE_IQ3_XXS,IQ3_XXS_BLOCK_SIZE,IQ3_XXS_BYTES_PER_BLOCK, dequant_iq3xxs);
+            break;
+        case GGUF_TYPE_IQ3_S:
+            LOAD_QUANT_TENSOR(GGUF_TYPE_IQ3_S,  IQ3_S_BLOCK_SIZE,  IQ3_S_BYTES_PER_BLOCK,   dequant_iq3s);
+            break;
+        case GGUF_TYPE_IQ4_XS:
+            LOAD_QUANT_TENSOR(GGUF_TYPE_IQ4_XS, IQ4_XS_BLOCK_SIZE, IQ4_XS_BYTES_PER_BLOCK,  dequant_iq4_xs);
+            break;
+        case GGUF_TYPE_Q3_K:
+            LOAD_QUANT_TENSOR(GGUF_TYPE_Q3_K,   Q3_K_BLOCK_SIZE,   Q3_K_BYTES_PER_BLOCK,    dequant_q3k);
+            break;
+        case GGUF_TYPE_Q4_K:
+            LOAD_QUANT_TENSOR(GGUF_TYPE_Q4_K,   Q4_K_BLOCK_SIZE,   Q4_K_BYTES_PER_BLOCK,    dequant_q4k);
+            break;
+        case GGUF_TYPE_Q5_K:
+            LOAD_QUANT_TENSOR(GGUF_TYPE_Q5_K,   Q5_K_BLOCK_SIZE,   Q5_K_BYTES_PER_BLOCK,    dequant_q5k);
+            break;
+        case GGUF_TYPE_Q6_K:
+            LOAD_QUANT_TENSOR(GGUF_TYPE_Q6_K,   Q6_K_BLOCK_SIZE,   Q6_K_BYTES_PER_BLOCK,    dequant_q6k);
+            break;
+        case GGUF_TYPE_Q8_0:
+            LOAD_QUANT_TENSOR(GGUF_TYPE_Q8_0,   Q8_0_BLOCK_SIZE,   Q8_0_BYTES_PER_BLOCK,    dequant_q8_0);
+            break;
+        default:
+            fprintf(stderr,"[ERROR] Unsupported tensor type %u for %s\n", t->type, t->name);
+            fprintf(stderr,"  Supported: F32/F16/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/IQ3_XXS/IQ3_S/IQ4_XS\n");
             fclose(f); free(tensors); exit(1);
         }
 
-        /* No transpose needed: llama.cpp GGUF already stores weights in [out, in] row-major. */
-
-        /* Diagnostic: print type, range, and first values for every tensor */
-//        {
-//            const char *tname = "UNK";
-//            if      (t->type == GGUF_TYPE_F32)  tname = "F32 ";
-//            else if (t->type == GGUF_TYPE_F16)  tname = "F16 ";
-//            else if (t->type == GGUF_TYPE_Q8_0) tname = "Q8_0";
-//            else if (t->type == GGUF_TYPE_Q5_K) tname = "Q5_K";
-//            else if (t->type == GGUF_TYPE_Q6_K) tname = "Q6_K";
-//            float mn = dst[0], mx = dst[0];
-//            for (size_t ei = 1; ei < t->n_elements && ei < 4096; ei++) {
-//                if (dst[ei] < mn) mn = dst[ei];
-//                if (dst[ei] > mx) mx = dst[ei];
-//            }
-//            fprintf(stderr, "[DIAG] %-50s  %s  n=%7zu  range=[%8.4f, %8.4f]  first4=[%.4f %.4f %.4f %.4f]\n",
-//                    t->name, tname, t->n_elements, mn, mx,
-//                    dst[0], dst[1], dst[2], dst[3]);
-//        }
-
         tensors_loaded++;
     }
+#undef LOAD_QUANT_TENSOR
 
     free(tensors);
     fclose(f);
-
     /* If output.weight was not present (weight-tied GGUF), lm_head already
      * points to the wte copy made above. Either way we're correct. */
     printf("[INFO] Tensors loaded: %d\n", tensors_loaded);
-    printf("[INFO] Loaded (GGUF F16): %s\n", path);
+    printf("[INFO] Loaded (GGUF): %s\n", path);
 }
 
 /* ============================================================
@@ -2148,36 +2110,27 @@ static void load_model_gguf(const char *path) {
  *     0x47505432 ("GPT2") → custom binary
  *     0x46554747 ("GGUF") → GGUF
  * ============================================================ */
-typedef enum {
-    FORMAT_UNKNOWN,
-    FORMAT_BIN,
-    FORMAT_GGUF
-} ModelFormat;
+typedef enum { FORMAT_UNKNOWN, FORMAT_BIN, FORMAT_GGUF } ModelFormat;
 
-static ModelFormat detect_format(const char *path){
-    /* Check file extension first (fast path) */
+static ModelFormat detect_format(const char *path) {
     size_t len = strlen(path);
-    if (len >= 5 && strcmp(path + len - 5, ".gguf") == 0) return FORMAT_GGUF;
-    if (len >= 4 && strcmp(path + len - 4, ".bin")  == 0) return FORMAT_BIN;
-
-    /* Peek at magic bytes */
-    FILE *f = fopen(path, "rb");
+    if (len >= 5 && strcmp(path+len-5,".gguf")==0) return FORMAT_GGUF;
+    if (len >= 4 && strcmp(path+len-4,".bin") ==0) return FORMAT_BIN;
+    FILE *f = fopen(path,"rb");
     if (!f) return FORMAT_UNKNOWN;
     uint32_t magic = 0;
     fread(&magic, sizeof(uint32_t), 1, f);
     fclose(f);
-
     if (magic == MODEL_MAGIC) return FORMAT_BIN;
     if (magic == GGUF_MAGIC)  return FORMAT_GGUF;
     return FORMAT_UNKNOWN;
 }
 
-/* Probe well-known default paths in order of preference */
 static const char* find_default_model(void) {
     static const char *candidates[] = {
-        "gpt2_124m.bin",
-        "gpt2.f16.gguf",
-        "gpt2.gguf",
+        "gpt2_124m.bin", "gpt2_medium.bin",
+        "gpt2.f16.gguf", "gpt2.gguf",
+        "gpt2-medium.f16.gguf", "gpt2-medium.gguf",
         NULL
     };
     for (int i = 0; candidates[i]; i++) {
@@ -2195,12 +2148,11 @@ static void load_model(const char *path) {
             load_model_bin(path);
             break;
         case FORMAT_GGUF:
-            printf("[INFO] Format: GGUF (.gguf) — F16/IQ3_XS/IQ3_S/IQ4_XS/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0 dequantization\n");
+            printf("[INFO] Format: GGUF\n");
             load_model_gguf(path);
             break;
         default:
-            fprintf(stderr, "[ERROR] Cannot determine format of: %s\n", path);
-            fprintf(stderr, "  Supported: *.bin (custom float32) or *.gguf (GGUF F16/F32)\n");
+            fprintf(stderr,"[ERROR] Cannot determine format: %s\n", path);
             exit(1);
     }
 }
@@ -2209,36 +2161,25 @@ static void load_model(const char *path) {
  * TOKENIZER
  * ============================================================ */
 static void init_byte_encoder(Tokenizer *tok) {
-    int bs[256], cs[256];
-    int n_bs = 0;
-
-    for (int b = 33;  b <= 126; b++) { bs[n_bs] = b; cs[n_bs] = b; n_bs++; }
-    for (int b = 161; b <= 172; b++) { bs[n_bs] = b; cs[n_bs] = b; n_bs++; }
-    for (int b = 174; b <= 255; b++) { bs[n_bs] = b; cs[n_bs] = b; n_bs++; }
-
+    int bs[256], cs[256], n_bs = 0;
+    for (int b=33;  b<=126; b++) { bs[n_bs]=b; cs[n_bs]=b; n_bs++; }
+    for (int b=161; b<=172; b++) { bs[n_bs]=b; cs[n_bs]=b; n_bs++; }
+    for (int b=174; b<=255; b++) { bs[n_bs]=b; cs[n_bs]=b; n_bs++; }
     int extra = 256;
-    for (int b = 0; b < 256; b++) {
-        int found = 0;
-        for (int i = 0; i < n_bs; i++) { if (bs[i] == b) { found = 1; break; } }
-        if (!found) { bs[n_bs] = b; cs[n_bs] = extra++; n_bs++; }
+    for (int b=0; b<256; b++) {
+        int found=0;
+        for (int i=0;i<n_bs;i++) if(bs[i]==b){found=1;break;}
+        if (!found) { bs[n_bs]=b; cs[n_bs]=extra++; n_bs++; }
     }
-
-    for (int i = 0; i < 256; i++) tok->byte_decoder[cs[i]] = bs[i];
-
-    for (int i = 0; i < 256; i++) {
-        int cp = cs[i];
-        char *out = tok->byte_encoder[bs[i]];
-        if (cp < 0x80) {
-            out[0] = (char)cp; out[1] = '\0';
-        } else if (cp < 0x800) {
-            out[0] = (char)(0xC0 | (cp >> 6));
-            out[1] = (char)(0x80 | (cp & 0x3F));
-            out[2] = '\0';
+    for (int i=0;i<256;i++) tok->byte_decoder[cs[i]]=bs[i];
+    for (int i=0;i<256;i++) {
+        int cp=cs[i]; char *out=tok->byte_encoder[bs[i]];
+        if (cp<0x80)  { out[0]=(char)cp; out[1]='\0'; }
+        else if (cp<0x800) {
+            out[0]=(char)(0xC0|(cp>>6)); out[1]=(char)(0x80|(cp&0x3F)); out[2]='\0';
         } else {
-            out[0] = (char)(0xE0 | (cp >> 12));
-            out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-            out[2] = (char)(0x80 | (cp & 0x3F));
-            out[3] = '\0';
+            out[0]=(char)(0xE0|(cp>>12)); out[1]=(char)(0x80|((cp>>6)&0x3F));
+            out[2]=(char)(0x80|(cp&0x3F)); out[3]='\0';
         }
     }
 }
@@ -2246,274 +2187,211 @@ static void init_byte_encoder(Tokenizer *tok) {
 static int utf8_decode(const char **s) {
     unsigned char c = (unsigned char)**s;
     int cp;
-    if (c < 0x80) {
-        cp = c; (*s)++;
-    } else if ((c & 0xE0) == 0xC0) {
-        cp  = (c & 0x1F) << 6; (*s)++;
-        cp |= ((unsigned char)**s & 0x3F); (*s)++;
-    } else if ((c & 0xF0) == 0xE0) {
-        cp  = (c & 0x0F) << 12; (*s)++;
-        cp |= ((unsigned char)**s & 0x3F) << 6; (*s)++;
-        cp |= ((unsigned char)**s & 0x3F); (*s)++;
-    } else {
-        cp = '?'; (*s)++;
-    }
+    if (c<0x80) { cp=c; (*s)++; }
+    else if ((c&0xE0)==0xC0) { cp=(c&0x1F)<<6; (*s)++; cp|=((unsigned char)**s&0x3F); (*s)++; }
+    else if ((c&0xF0)==0xE0) {
+        cp=(c&0x0F)<<12; (*s)++;
+        cp|=((unsigned char)**s&0x3F)<<6; (*s)++;
+        cp|=((unsigned char)**s&0x3F); (*s)++;
+    } else { cp='?'; (*s)++; }
     return cp;
 }
 
 static uint32_t str_hash(const uint8_t *s, int len) {
-    uint32_t h = 2166136261u;
-    for (int i = 0; i < len; i++) { h ^= s[i]; h *= 16777619u; }
+    uint32_t h=2166136261u;
+    for (int i=0;i<len;i++) { h^=s[i]; h*=16777619u; }
     return h;
 }
-
-static void vocab_hash_insert(Tokenizer *tok, int token_id) {
-    uint32_t h    = str_hash(tok->vocab[token_id].bytes, tok->vocab[token_id].len);
-    uint32_t slot = h % VOCAB_HASH_SIZE;
-    tok->vocab_hash_next[token_id] = tok->vocab_hash[slot];
-    tok->vocab_hash[slot] = token_id;
+static void vocab_hash_insert(Tokenizer *tok, int tid) {
+    uint32_t slot = str_hash(tok->vocab[tid].bytes, tok->vocab[tid].len) % VOCAB_HASH_SIZE;
+    tok->vocab_hash_next[tid] = tok->vocab_hash[slot];
+    tok->vocab_hash[slot] = tid;
 }
-
 static int vocab_lookup(const Tokenizer *tok, const uint8_t *s, int len) {
-    uint32_t slot = str_hash(s, len) % VOCAB_HASH_SIZE;
+    uint32_t slot = str_hash(s,len) % VOCAB_HASH_SIZE;
     int id = tok->vocab_hash[slot];
     while (id != -1) {
-        if (tok->vocab[id].len == len &&
-            memcmp(tok->vocab[id].bytes, s, len) == 0) return id;
+        if (tok->vocab[id].len==len && memcmp(tok->vocab[id].bytes,s,len)==0) return id;
         id = tok->vocab_hash_next[id];
     }
     return -1;
 }
 
 static void load_encoder_json(Tokenizer *tok, const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "[ERROR] Cannot open encoder.json: %s\n", path);
-        exit(1);
-    }
-
-    memset(tok->vocab_hash,      -1, sizeof(tok->vocab_hash));
-    memset(tok->vocab_hash_next, -1, sizeof(tok->vocab_hash_next));
+    FILE *f = fopen(path,"r");
+    if (!f) { fprintf(stderr,"[ERROR] Cannot open encoder.json: %s\n",path); exit(1); }
+    memset(tok->vocab_hash,     -1,sizeof(tok->vocab_hash));
+    memset(tok->vocab_hash_next,-1,sizeof(tok->vocab_hash_next));
     tok->vocab_size = 0;
-
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    char *buf = (char*)malloc((size_t)fsize + 1);
-    if (!buf) { fprintf(stderr, "[FATAL] OOM loading encoder.json\n"); fclose(f); exit(1); }
-
-    if (fread(buf, 1, (size_t)fsize, f) != (size_t)fsize) {
-        fprintf(stderr, "[ERROR] Short read on encoder.json\n");
-        free(buf); fclose(f); exit(1);
-    }
-    buf[fsize] = '\0';
-    fclose(f);
-
-    char *p = buf;
-    while (*p && *p != '{') p++;
-    if (*p) p++;
-
-    while (*p) {
-        while (*p && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ',')) p++;
-        if (*p == '}') break;
-        if (*p != '"') { p++; continue; }
-
-        p++;  /* skip '"' */
-        uint8_t key[BPE_TOKEN_MAX_LEN];
-        int key_len = 0;
-
-        while (*p && *p != '"' && key_len < BPE_TOKEN_MAX_LEN - 1) {
-            if (*p == '\\') {
+    fseek(f,0,SEEK_END); long fsize=ftell(f); fseek(f,0,SEEK_SET);
+    char *buf=(char*)malloc((size_t)fsize+1);
+    if (!buf) { fprintf(stderr,"[FATAL] OOM encoder.json\n"); fclose(f); exit(1); }
+    if (fread(buf,1,(size_t)fsize,f)!=(size_t)fsize) {
+        fprintf(stderr,"[ERROR] Short read encoder.json\n"); free(buf); fclose(f); exit(1); }
+    buf[fsize]='\0'; fclose(f);
+    char *p=buf;
+    while(*p&&*p!='{')p++; if(*p)p++;
+    while(*p) {
+        while(*p&&(*p==' '||*p=='\n'||*p=='\r'||*p=='\t'||*p==','))p++;
+        if(*p=='}')break;
+        if(*p!='"'){p++;continue;}
+        p++;
+        uint8_t key[BPE_TOKEN_MAX_LEN]; int key_len=0;
+        while(*p&&*p!='"'&&key_len<BPE_TOKEN_MAX_LEN-1) {
+            if(*p=='\\') {
                 p++;
-                switch (*p) {
-                    case '"':  key[key_len++] = '"';  p++; break;
-                    case '\\': key[key_len++] = '\\'; p++; break;
-                    case '/':  key[key_len++] = '/';  p++; break;
-                    case 'n':  key[key_len++] = '\n'; p++; break;
-                    case 'r':  key[key_len++] = '\r'; p++; break;
-                    case 't':  key[key_len++] = '\t'; p++; break;
-                    case 'b':  key[key_len++] = '\b'; p++; break;
-                    case 'f':  key[key_len++] = '\f'; p++; break;
+                switch(*p) {
+                    case '"':  key[key_len++]='"';  p++;break;
+                    case '\\': key[key_len++]='\\'; p++;break;
+                    case '/':  key[key_len++]='/';  p++;break;
+                    case 'n':  key[key_len++]='\n'; p++;break;
+                    case 'r':  key[key_len++]='\r'; p++;break;
+                    case 't':  key[key_len++]='\t'; p++;break;
+                    case 'b':  key[key_len++]='\b'; p++;break;
+                    case 'f':  key[key_len++]='\f'; p++;break;
                     case 'u': {
-                        p++;
-                        char hex[5] = {0};
-                        for (int hi = 0; hi < 4 && *p; hi++) hex[hi] = *p++;
-                        int cp = (int)strtol(hex, NULL, 16);
-                        if (cp < 0x80) {
-                            key[key_len++] = (uint8_t)cp;
-                        } else if (cp < 0x800) {
-                            key[key_len++] = (uint8_t)(0xC0 | (cp >> 6));
-                            key[key_len++] = (uint8_t)(0x80 | (cp & 0x3F));
+                        p++; char hex[5]={0};
+                        for(int hi=0;hi<4&&*p;hi++)hex[hi]=*p++;
+                        int cp=(int)strtol(hex,NULL,16);
+                        if(cp<0x80) key[key_len++]=(uint8_t)cp;
+                        else if(cp<0x800){
+                            key[key_len++]=(uint8_t)(0xC0|(cp>>6));
+                            key[key_len++]=(uint8_t)(0x80|(cp&0x3F));
                         } else {
-                            key[key_len++] = (uint8_t)(0xE0 | (cp >> 12));
-                            key[key_len++] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
-                            key[key_len++] = (uint8_t)(0x80 | (cp & 0x3F));
+                            key[key_len++]=(uint8_t)(0xE0|(cp>>12));
+                            key[key_len++]=(uint8_t)(0x80|((cp>>6)&0x3F));
+                            key[key_len++]=(uint8_t)(0x80|(cp&0x3F));
                         }
                         break;
                     }
-                    default: key[key_len++] = (uint8_t)*p++; break;
+                    default: key[key_len++]=(uint8_t)*p++;break;
                 }
-            } else {
-                key[key_len++] = (uint8_t)*p++;
-            }
+            } else { key[key_len++]=(uint8_t)*p++; }
         }
-        if (*p == '"') p++;
-
-        while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
-        if (*p < '0' || *p > '9') continue;
-
-        int token_id = 0;
-        while (*p >= '0' && *p <= '9') { token_id = token_id * 10 + (*p - '0'); p++; }
-
-        if (token_id < BPE_MAX_VOCAB) {
-            memcpy(tok->vocab[token_id].bytes, key, (size_t)key_len);
-            tok->vocab[token_id].len = key_len;
-            vocab_hash_insert(tok, token_id);
-            if (token_id + 1 > tok->vocab_size) tok->vocab_size = token_id + 1;
+        if(*p=='"')p++;
+        while(*p&&(*p==' '||*p==':'||*p=='\t'))p++;
+        if(*p<'0'||*p>'9')continue;
+        int token_id=0;
+        while(*p>='0'&&*p<='9'){token_id=token_id*10+(*p-'0');p++;}
+        if(token_id<BPE_MAX_VOCAB){
+            memcpy(tok->vocab[token_id].bytes,key,(size_t)key_len);
+            tok->vocab[token_id].len=key_len;
+            vocab_hash_insert(tok,token_id);
+            if(token_id+1>tok->vocab_size)tok->vocab_size=token_id+1;
         }
     }
-
     free(buf);
     printf("[INFO] Vocabulary loaded: %d tokens\n", tok->vocab_size);
 }
 
-/* FIX #2: unified skip logic (the original had a double-skip dead code path) */
+/* unified skip logic (the original had a double-skip dead code path) */
 static void load_vocab_bpe(Tokenizer *tok, const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "[ERROR] Cannot open vocab.bpe: %s\n", path);
-        exit(1);
-    }
-
-    tok->n_merges = 0;
+    FILE *f = fopen(path,"r");
+    if (!f) { fprintf(stderr,"[ERROR] Cannot open vocab.bpe: %s\n",path); exit(1); }
+    tok->n_merges=0;
     char line[1024];
-
-    /* Skip version header line */
-    if (!fgets(line, sizeof(line), f)) { fclose(f); return; }
-
-    while (fgets(line, sizeof(line), f) && tok->n_merges < BPE_MAX_MERGES) {
-        int len = (int)strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
-        if (len == 0) continue;
-
-        char *space = strchr(line, ' ');
-        if (!space) continue;
-        *space = '\0';
-        char *left_str  = line;
-        char *right_str = space + 1;
-
-        int left_id  = vocab_lookup(tok, (const uint8_t*)left_str,  (int)strlen(left_str));
-        int right_id = vocab_lookup(tok, (const uint8_t*)right_str, (int)strlen(right_str));
-
-        /* FIX #2: single unified skip; original had unreachable dead code */
-        if (left_id == -1 || right_id == -1) continue;
-
-        int ll = (int)strlen(left_str), rl = (int)strlen(right_str);
-        if (ll + rl >= BPE_TOKEN_MAX_LEN) continue;
-
+    if (!fgets(line,sizeof(line),f)) { fclose(f); return; }
+    while (fgets(line,sizeof(line),f) && tok->n_merges<BPE_MAX_MERGES) {
+        int len=(int)strlen(line);
+        while(len>0&&(line[len-1]=='\n'||line[len-1]=='\r'))line[--len]='\0';
+        if(len==0)continue;
+        char *space=strchr(line,' ');
+        if(!space)continue;
+        *space='\0';
+        char *left_str=line, *right_str=space+1;
+        int left_id =vocab_lookup(tok,(const uint8_t*)left_str, (int)strlen(left_str));
+        int right_id=vocab_lookup(tok,(const uint8_t*)right_str,(int)strlen(right_str));
+        if(left_id==-1||right_id==-1)continue;
+        int ll=(int)strlen(left_str),rl=(int)strlen(right_str);
+        if(ll+rl>=BPE_TOKEN_MAX_LEN)continue;
         uint8_t merged[BPE_TOKEN_MAX_LEN];
-        memcpy(merged, left_str, (size_t)ll);
-        memcpy(merged + ll, right_str, (size_t)rl);
-        int result_id = vocab_lookup(tok, merged, ll + rl);
-        if (result_id == -1) continue;
-
-        tok->merges[tok->n_merges].left   = left_id;
-        tok->merges[tok->n_merges].right  = right_id;
-        tok->merges[tok->n_merges].result = result_id;
+        memcpy(merged,left_str,(size_t)ll);
+        memcpy(merged+ll,right_str,(size_t)rl);
+        int result_id=vocab_lookup(tok,merged,ll+rl);
+        if(result_id==-1)continue;
+        tok->merges[tok->n_merges].left  =left_id;
+        tok->merges[tok->n_merges].right =right_id;
+        tok->merges[tok->n_merges].result=result_id;
         tok->n_merges++;
     }
-
     fclose(f);
     printf("[INFO] BPE merges loaded: %d rules\n", tok->n_merges);
 }
 
-static void load_tokenizer(const char *encoder_path, const char *bpe_path) {
+static void load_tokenizer(const char *ep, const char *bp) {
     init_byte_encoder(&g_tokenizer);
-    load_encoder_json(&g_tokenizer, encoder_path);
-    load_vocab_bpe(&g_tokenizer, bpe_path);
+    load_encoder_json(&g_tokenizer, ep);
+    load_vocab_bpe(&g_tokenizer, bp);
 }
-
 /* ============================================================
  * BPE ENCODING
  * ============================================================ */
 #define MAX_WORD_LEN    128
 #define MAX_WORD_TOKENS (MAX_WORD_LEN * 4)
-
 typedef struct { int ids[MAX_WORD_TOKENS]; int len; } TokenSeq;
 
 static void bpe_apply_merges(TokenSeq *seq, const Tokenizer *tok) {
     while (seq->len >= 2) {
-        int best_merge = tok->n_merges, best_pos = -1;
-        for (int i = 0; i < seq->len - 1; i++) {
-            int a = seq->ids[i], b = seq->ids[i+1];
-            for (int m = 0; m < tok->n_merges; m++) {
-                if (tok->merges[m].left == a && tok->merges[m].right == b) {
-                    if (m < best_merge) { best_merge = m; best_pos = i; }
+        int best_merge=tok->n_merges, best_pos=-1;
+        for (int i=0;i<seq->len-1;i++) {
+            int a=seq->ids[i],b=seq->ids[i+1];
+            for (int m=0;m<tok->n_merges;m++) {
+                if(tok->merges[m].left==a&&tok->merges[m].right==b) {
+                    if(m<best_merge){best_merge=m;best_pos=i;}
                     break;
                 }
             }
         }
-        if (best_pos == -1) break;
-        seq->ids[best_pos] = tok->merges[best_merge].result;
-        for (int i = best_pos + 1; i < seq->len - 1; i++) seq->ids[i] = seq->ids[i+1];
+        if(best_pos==-1)break;
+        seq->ids[best_pos]=tok->merges[best_merge].result;
+        for(int i=best_pos+1;i<seq->len-1;i++)seq->ids[i]=seq->ids[i+1];
         seq->len--;
     }
 }
 
-static int encode_word(const Tokenizer *tok,
-                       const uint8_t *word_bytes, int word_len,
-                       int *out_ids) {
-    TokenSeq seq = {.len = 0};
-    for (int i = 0; i < word_len && seq.len < MAX_WORD_TOKENS; i++) {
-        uint8_t b = word_bytes[i];
-        const char *encoded = tok->byte_encoder[b];
-        int tid = vocab_lookup(tok, (const uint8_t*)encoded, (int)strlen(encoded));
-        seq.ids[seq.len++] = (tid == -1) ? (int)b : tid;
+static int encode_word(const Tokenizer *tok, const uint8_t *word_bytes,
+                       int word_len, int *out_ids) {
+    TokenSeq seq={.len=0};
+    for(int i=0;i<word_len&&seq.len<MAX_WORD_TOKENS;i++) {
+        uint8_t b=word_bytes[i];
+        const char *enc=tok->byte_encoder[b];
+        int tid=vocab_lookup(tok,(const uint8_t*)enc,(int)strlen(enc));
+        seq.ids[seq.len++]=(tid==-1)?(int)b:tid;
     }
-    bpe_apply_merges(&seq, tok);
-    for (int i = 0; i < seq.len; i++) out_ids[i] = seq.ids[i];
+    bpe_apply_merges(&seq,tok);
+    for(int i=0;i<seq.len;i++)out_ids[i]=seq.ids[i];
     return seq.len;
 }
 
 static int tokenize(const Tokenizer *tok, const char *text,
                     int *out_ids, int max_tokens) {
-    int n_tokens = 0;
-    const uint8_t *p = (const uint8_t*)text;
-    int text_len = (int)strlen(text);
-    int i = 0;
-
-    while (i < text_len && n_tokens < max_tokens) {
-        uint8_t word[MAX_WORD_LEN];
-        int wlen = 0;
-
-        if (p[i] == ' ' && i + 1 < text_len) word[wlen++] = p[i++];
-
-        if (i >= text_len) {
-            if (wlen > 0) {
+    int n_tokens=0;
+    const uint8_t *p=(const uint8_t*)text;
+    int text_len=(int)strlen(text), i=0;
+    while(i<text_len&&n_tokens<max_tokens) {
+        uint8_t word[MAX_WORD_LEN]; int wlen=0;
+        if(p[i]==' '&&i+1<text_len)word[wlen++]=p[i++];
+        if(i>=text_len) {
+            if(wlen>0){
                 int word_ids[MAX_WORD_TOKENS];
-                int n = encode_word(tok, word, wlen, word_ids);
-                for (int j = 0; j < n && n_tokens < max_tokens; j++) out_ids[n_tokens++] = word_ids[j];
+                int n=encode_word(tok,word,wlen,word_ids);
+                for(int j=0;j<n&&n_tokens<max_tokens;j++)out_ids[n_tokens++]=word_ids[j];
             }
             break;
         }
-
-        uint8_t c = p[i];
-        if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c>=0x80) {
-            while (i < text_len && wlen < MAX_WORD_LEN - 1) {
-                uint8_t cc = p[i];
-                if ((cc>='A'&&cc<='Z')||(cc>='a'&&cc<='z')||(cc>='0'&&cc<='9')||cc>=0x80)
-                    word[wlen++] = p[i++];
+        uint8_t c=p[i];
+        if((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c>=0x80) {
+            while(i<text_len&&wlen<MAX_WORD_LEN-1) {
+                uint8_t cc=p[i];
+                if((cc>='A'&&cc<='Z')||(cc>='a'&&cc<='z')||(cc>='0'&&cc<='9')||cc>=0x80)
+                    word[wlen++]=p[i++];
                 else break;
             }
-        } else {
-            word[wlen++] = p[i++];
-        }
-
-        if (wlen > 0) {
+        } else { word[wlen++]=p[i++]; }
+        if(wlen>0) {
             int word_ids[MAX_WORD_TOKENS];
-            int n = encode_word(tok, word, wlen, word_ids);
-            for (int j = 0; j < n && n_tokens < max_tokens; j++) out_ids[n_tokens++] = word_ids[j];
+            int n=encode_word(tok,word,wlen,word_ids);
+            for(int j=0;j<n&&n_tokens<max_tokens;j++)out_ids[n_tokens++]=word_ids[j];
         }
     }
     return n_tokens;
@@ -2521,16 +2399,16 @@ static int tokenize(const Tokenizer *tok, const char *text,
 
 static int detokenize_token(const Tokenizer *tok, int token_id,
                             char *out_buf, int buf_size) {
-    if (token_id < 0 || token_id >= tok->vocab_size) return 0;
-    const VocabEntry *ve = &tok->vocab[token_id];
-    const char *s = (const char*)ve->bytes;
-    const char *end = s + ve->len;
-    int out_len = 0;
-    while (s < end && out_len < buf_size - 1) {
-        int cp = utf8_decode(&s);
-        if (cp >= 0 && cp < 0x400) out_buf[out_len++] = (char)tok->byte_decoder[cp];
+    if(token_id<0||token_id>=tok->vocab_size)return 0;
+    const VocabEntry *ve=&tok->vocab[token_id];
+    const char *s=(const char*)ve->bytes;
+    const char *end=s+ve->len;
+    int out_len=0;
+    while(s<end&&out_len<buf_size-1) {
+        int cp=utf8_decode(&s);
+        if(cp>=0&&cp<0x400)out_buf[out_len++]=(char)tok->byte_decoder[cp];
     }
-    out_buf[out_len] = '\0';
+    out_buf[out_len]='\0';
     return out_len;
 }
 
@@ -2539,13 +2417,9 @@ static int detokenize_token(const Tokenizer *tok, int token_id,
  * ============================================================ */
 static void generate(const char *prompt, int max_new_tokens,
                      float temperature, float top_p) {
-    int prompt_tokens[GPT2_SEQ_LEN];
-    int n_prompt = tokenize(&g_tokenizer, prompt, prompt_tokens, GPT2_SEQ_LEN);
-
-    if (n_prompt == 0) {
-        fprintf(stderr, "[ERROR] Empty prompt after tokenization.\n");
-        return;
-    }
+    int prompt_tokens[MAX_SEQ_LEN];
+    int n_prompt = tokenize(&g_tokenizer, prompt, prompt_tokens, CFG_S);
+    if (n_prompt == 0) { fprintf(stderr,"[ERROR] Empty prompt.\n"); return; }
     printf("[INFO] Prompt tokens: %d\n", n_prompt);
     printf("\n--- Generated Text ---\n%s", prompt);
     fflush(stdout);
@@ -2554,26 +2428,21 @@ static void generate(const char *prompt, int max_new_tokens,
     float *logits = NULL;
     for (int i = 0; i < n_prompt; i++) {
         logits = model_forward(prompt_tokens[i], i);
-        g_kv_cache.seq_len = i + 1;
+        g_kv_cache.seq_len = i+1;
     }
 
     int pos = n_prompt;
     char decode_buf[64];
-
     for (int step = 0; step < max_new_tokens; step++) {
-        if (pos >= GPT2_SEQ_LEN) { printf("\n[Context window full]\n"); break; }
-
+        if (pos >= CFG_S) { printf("\n[Context window full]\n"); break; }
         int next_token = sample_top_p(logits, temperature, top_p);
         if (next_token == 50256) { printf("\n[EOS]\n"); break; }
-
         int dec_len = detokenize_token(&g_tokenizer, next_token, decode_buf, sizeof(decode_buf));
         if (dec_len > 0) { fwrite(decode_buf, 1, (size_t)dec_len, stdout); fflush(stdout); }
-
         logits = model_forward(next_token, pos);
-        g_kv_cache.seq_len = pos + 1;
+        g_kv_cache.seq_len = pos+1;
         pos++;
     }
-
     printf("\n--- Done: %d tokens generated ---\n", pos - n_prompt);
 }
 
@@ -2588,59 +2457,49 @@ static void generate(const char *prompt, int max_new_tokens,
  *   2. gpt2.f16.gguf   (GGUF FP16)
  *   3. gpt2.gguf       (GGUF any)
  * ============================================================ */
+
 int main(int argc, char *argv[]) {
     printf("==============================================\n");
-    printf("  lm.c — Unified GPT-2 Inference (C99)\n");
-    printf("  Backends: custom .bin  |  GGUF .gguf (F32/F16/IQ3_XS/IQ3_S/IQ3_M/IQ4_XS/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0)\n");
-    printf("===========================================================================\n\n");
+    printf("  lm.c — GPT-2 Inference (Small + Medium)\n");
+    printf("  Architecture parameters read at runtime from model file.\n");
+    printf("==============================================\n\n");
 
-    const char *prompt      = "Hello, world!";
-    int         max_tokens  = 64;
-    float       temperature = 0.7f;
-    float       top_p       = 0.9f;
-    const char *model_path  = NULL;
+    const char *prompt       = "Hello, world!";
+    int         max_tokens   = 64;
+    float       temperature  = 0.7f;
+    float       top_p        = 0.9f;
+    const char *model_path   = NULL;
     const char *encoder_path = "encoder.json";
     const char *bpe_path     = "vocab.bpe";
 
-    /* Parse args */
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
-            model_path = argv[++i];
-        } else if (strcmp(argv[i], "--encoder") == 0 && i + 1 < argc) {
-            encoder_path = argv[++i];
-        } else if (strcmp(argv[i], "--bpe") == 0 && i + 1 < argc) {
-            bpe_path = argv[++i];
-        } else if (i == 1 && argv[i][0] != '-') {
-            prompt = argv[i];
-        } else if (i == 2 && argv[i][0] != '-') {
-            max_tokens = atoi(argv[i]);
-        } else if (i == 3 && argv[i][0] != '-') {
-            temperature = (float)atof(argv[i]);
-        } else if (i == 4 && argv[i][0] != '-') {
-            top_p = (float)atof(argv[i]);
-        }
+    for (int i=1;i<argc;i++) {
+        if      (strcmp(argv[i],"--model")==0   &&i+1<argc) model_path   = argv[++i];
+        else if (strcmp(argv[i],"--encoder")==0 &&i+1<argc) encoder_path = argv[++i];
+        else if (strcmp(argv[i],"--bpe")==0     &&i+1<argc) bpe_path     = argv[++i];
+        else if (i==1&&argv[i][0]!='-') prompt      = argv[i];
+        else if (i==2&&argv[i][0]!='-') max_tokens  = atoi(argv[i]);
+        else if (i==3&&argv[i][0]!='-') temperature = (float)atof(argv[i]);
+        else if (i==4&&argv[i][0]!='-') top_p       = (float)atof(argv[i]);
     }
 
-    /* Validate */
     if (max_tokens <= 0) max_tokens = 64;
-    if (max_tokens > GPT2_SEQ_LEN - 10) max_tokens = GPT2_SEQ_LEN - 10;
+    if (max_tokens > MAX_SEQ_LEN - 10) max_tokens = MAX_SEQ_LEN - 10;
     if (temperature < 0.0f) temperature = 0.7f;
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 0.9f;
 
-    /* Auto-detect model path */
     if (!model_path) {
         model_path = find_default_model();
         if (!model_path) {
             fprintf(stderr,
-                "[ERROR] No model file found. Tried: gpt2_124m.bin, gpt2.f16.gguf\n"
-                "  Run:  python3 converter.py          → generates gpt2_124m.bin\n"
-                "  Or:   ollama pull gpt2              → then locate the .gguf file\n"
+                "[ERROR] No model file found.\n"
+                "  Tried: gpt2_124m.bin, gpt2_medium.bin, gpt2.f16.gguf, gpt2.gguf,\n"
+                "         gpt2-medium.f16.gguf, gpt2-medium.gguf\n"
                 "  Or pass: --model <path>\n");
             return 1;
         }
     }
 
-    printf("[CONFIG] model:       %s\n", model_path);
+    printf("[CONFIG] model:       %s\n",   model_path);
     printf("[CONFIG] prompt:      \"%s\"\n", prompt);
     printf("[CONFIG] max_tokens:  %d\n",   max_tokens);
     printf("[CONFIG] temperature: %.2f\n", temperature);
@@ -2661,11 +2520,10 @@ int main(int argc, char *argv[]) {
 
     generate(prompt, max_tokens, temperature, top_p);
 
-    /* Cleanup */
     free(g_arena.data);
+    free(g_weights.layers);   /* LayerWeights array (heap, not arena) */
     free(g_kv_cache.k_cache);
     free(g_kv_cache.v_cache);
     free_activations();
-
     return 0;
 }
